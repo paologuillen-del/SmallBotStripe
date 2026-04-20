@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -240,7 +241,7 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
         "callback_id": RESULTS_MODAL_CALLBACK,
         "private_metadata": session_id,
         "notify_on_close": True,
-        "title": {"type": "plain_text", "text": "Pick Subscription"},
+        "title": {"type": "plain_text", "text": "Pick Subscriptions"},
         "submit": {"type": "plain_text", "text": "Review"},
         "close": {"type": "plain_text", "text": "Close"},
         "blocks": [
@@ -258,13 +259,13 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
             {
                 "type": "input",
                 "block_id": "subscription_block",
-                "label": {"type": "plain_text", "text": "Subscription"},
+                "label": {"type": "plain_text", "text": "Subscriptions"},
                 "element": {
-                    "type": "static_select",
+                    "type": "multi_static_select",
                     "action_id": "subscription_select",
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "Choose one subscription",
+                        "text": "Choose one or more subscriptions",
                     },
                     "options": option_list,
                 },
@@ -273,14 +274,26 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
     }
 
 
-def build_confirmation_modal(session_id, subscription):
+def build_confirmation_modal(session_id, subscriptions):
+    lines = []
+    for subscription in subscriptions[:10]:
+        lines.append(
+            f"`{subscription['subscription_id']}` | {subscription['status']} | {subscription['email']}"
+        )
+
+    if len(subscriptions) > 10:
+        lines.append(f"...and {len(subscriptions) - 10} more")
+
+    selected_ids = [subscription["subscription_id"] for subscription in subscriptions]
     return {
         "type": "modal",
         "callback_id": CONFIRM_MODAL_CALLBACK,
-        "private_metadata": f"{session_id}:{subscription['subscription_id']}",
+        "private_metadata": json.dumps(
+            {"session_id": session_id, "subscription_ids": selected_ids}
+        ),
         "notify_on_close": True,
         "title": {"type": "plain_text", "text": "Confirm Cancel"},
-        "submit": {"type": "plain_text", "text": "Cancel it"},
+        "submit": {"type": "plain_text", "text": "Cancel selected"},
         "close": {"type": "plain_text", "text": "Close"},
         "blocks": [
             {
@@ -288,32 +301,32 @@ def build_confirmation_modal(session_id, subscription):
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        "*You are about to cancel this subscription:*\n"
-                        f"`{subscription['subscription_id']}`"
+                        f"*You are about to cancel {len(subscriptions)} subscription(s):*\n"
+                        + "\n".join(lines)
                     ),
                 },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Email*\n{subscription['email']}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Status*\n{subscription['status']}",
-                    },
-                ],
             },
         ],
     }
 
 
-def build_status_modal(result):
-    verification = result["verification"]
-    response = result["response"]
-    status_line = "verified" if verification["verified"] else "not verified"
+def build_status_modal(results):
+    if not isinstance(results, list):
+        results = [results]
+
+    success_count = sum(1 for result in results if result["verification"]["verified"])
+    summary_lines = []
+    for result in results[:10]:
+        verification = result["verification"]
+        response = result["response"]
+        status_line = "verified" if verification["verified"] else "not verified"
+        summary_lines.append(
+            f"`{response['subscription_id']}` | {response['status']} | {status_line}"
+        )
+
+    if len(results) > 10:
+        summary_lines.append(f"...and {len(results) - 10} more")
+
     return {
         "type": "modal",
         "callback_id": "stripe_status_modal",
@@ -325,34 +338,10 @@ def build_status_modal(result):
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"*Cancellation completed:* `{response['subscription_id']}`\n"
-                        f"*Verification:* {status_line}"
+                        f"*Cancellation completed:* {success_count}/{len(results)} verified\n"
+                        + "\n".join(summary_lines)
                     ),
                 },
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Response status*\n{response['status']}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Verified status*\n{verification['status']}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Email*\n{verification['email']}",
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            "*Canceled at*\n"
-                            f"{verification['canceled_at'] or 'not returned'}"
-                        ),
-                    },
-                ],
             },
         ],
     }
@@ -473,21 +462,23 @@ def handle_results_submission(ack, body):
         )
         return
 
-    selected_id = (
+    selected_options = (
         body["view"]["state"]["values"]["subscription_block"]["subscription_select"]
-        ["selected_option"]["value"]
+        .get("selected_options", [])
     )
+    selected_ids = [option["value"] for option in selected_options]
 
-    selected = None
+    selected = []
     for subscription in session["subscriptions"]:
-        if subscription["subscription_id"] == selected_id:
-            selected = subscription
-            break
+        if subscription["subscription_id"] in selected_ids:
+            selected.append(subscription)
 
-    if not selected:
+    if not selected or len(selected) != len(selected_ids):
         ack(
             response_action="update",
-            view=build_error_modal("That subscription is no longer available. Run the command again."),
+            view=build_error_modal(
+                "One or more selected subscriptions are no longer available. Run the command again."
+            ),
         )
         delete_session(session_id)
         return
@@ -497,7 +488,9 @@ def handle_results_submission(ack, body):
 
 @app.view(CONFIRM_MODAL_CALLBACK)
 def handle_confirmation_submission(ack, body, client, logger):
-    session_id, subscription_id = body["view"]["private_metadata"].split(":", 1)
+    metadata = json.loads(body["view"]["private_metadata"])
+    session_id = metadata["session_id"]
+    subscription_ids = metadata["subscription_ids"]
     user_id = body["user"]["id"]
     view_id = body["view"]["id"]
     session = get_session(session_id, user_id)
@@ -513,20 +506,24 @@ def handle_confirmation_submission(ack, body, client, logger):
         response_action="update",
         view=build_loading_modal(
             "Cancelling",
-            f"Cancelling `{subscription_id}` and verifying the Stripe response.",
+            f"Cancelling {len(subscription_ids)} subscription(s) and verifying the Stripe response.",
         ),
     )
 
     try:
-        result = cancel_subscription(session["api_key"], subscription_id)
+        results = []
+        for subscription_id in subscription_ids:
+            results.append(cancel_subscription(session["api_key"], subscription_id))
         delete_session(session_id)
-        client.views_update(view_id=view_id, view=build_status_modal(result))
+        client.views_update(view_id=view_id, view=build_status_modal(results))
     except stripe.error.StripeError as error:
         message = getattr(error, "user_message", None) or str(error)
         delete_session(session_id)
         client.views_update(
             view_id=view_id,
-            view=build_error_modal(f"Stripe could not cancel the subscription: {message}"),
+            view=build_error_modal(
+                f"Stripe could not cancel the selected subscriptions: {message}"
+            ),
         )
     except Exception as error:
         logger.exception("Unhandled Stripe cancellation error")
@@ -551,7 +548,7 @@ def handle_confirm_closed(ack, body):
     metadata = body["view"].get("private_metadata", "")
     if not metadata:
         return
-    session_id = metadata.split(":", 1)[0]
+    session_id = json.loads(metadata)["session_id"]
     delete_session(session_id)
 
 
