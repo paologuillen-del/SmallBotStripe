@@ -60,4 +60,3 @@ Recommended bot scopes:
 - The Slack app keeps the pasted Stripe restricted key only in memory for the active workflow session.
 - The app deletes the in-memory session after cancellation or when the modal is closed.
 - Slack modal inputs are not masked like password fields, so use restricted keys only.
-# SmallBotStripe
