@@ -32,6 +32,10 @@ STATUS_OPTIONS = [
     ("incomplete", "Incomplete"),
     ("incomplete_expired", "Incomplete expired"),
 ]
+PRICE_OPTIONS = [
+    ("any", "Any price"),
+    ("over_5_usd", "Over $5 USD (auto-refund on cancel)"),
+]
 
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
@@ -56,7 +60,15 @@ def cleanup_expired_sessions():
             del SESSIONS[session_id]
 
 
-def store_session(user_id, api_key, search_text, status_filter, subscriptions):
+def store_session(
+    user_id,
+    api_key,
+    search_text,
+    status_filter,
+    price_filter,
+    refund_on_cancel,
+    subscriptions,
+):
     cleanup_expired_sessions()
     session_id = uuid.uuid4().hex
     summaries = [serialize_for_slack(subscription) for subscription in subscriptions]
@@ -67,6 +79,8 @@ def store_session(user_id, api_key, search_text, status_filter, subscriptions):
             "api_key": api_key,
             "search_text": search_text,
             "status_filter": status_filter,
+            "price_filter": price_filter,
+            "refund_on_cancel": refund_on_cancel,
             "subscriptions": summaries,
             "updated_at": time.time(),
         }
@@ -96,12 +110,34 @@ def delete_session(session_id):
 def serialize_for_slack(subscription):
     customer = getattr(subscription, "customer", None)
     email = getattr(customer, "email", None) if customer else None
+    items = getattr(getattr(subscription, "items", None), "data", None) or []
+    price_usd_cents = 0
+    refund_eligible = True if items else False
+
+    for item in items:
+        price = getattr(item, "price", None)
+        currency = getattr(price, "currency", None) if price else None
+        unit_amount = getattr(price, "unit_amount", None) if price else None
+        quantity = getattr(item, "quantity", None) or 1
+
+        if currency != "usd" or unit_amount is None:
+            refund_eligible = False
+            price_usd_cents = None
+            break
+
+        price_usd_cents += unit_amount * quantity
+
+    if price_usd_cents is not None:
+        refund_eligible = refund_eligible and price_usd_cents > 500
+
     return {
         "subscription_id": subscription.id,
         "status": subscription.status,
         "customer_id": getattr(customer, "id", None),
         "email": email or "(no email)",
         "current_period_end": getattr(subscription, "current_period_end", None),
+        "price_usd_cents": price_usd_cents,
+        "refund_eligible": refund_eligible,
     }
 
 
@@ -115,6 +151,15 @@ def build_search_modal():
     status_options = []
     for value, label in STATUS_OPTIONS:
         status_options.append(
+            {
+                "text": {"type": "plain_text", "text": label},
+                "value": value,
+            }
+        )
+
+    price_options = []
+    for value, label in PRICE_OPTIONS:
+        price_options.append(
             {
                 "text": {"type": "plain_text", "text": label},
                 "value": value,
@@ -185,6 +230,25 @@ def build_search_modal():
                     "options": status_options,
                 },
             },
+            {
+                "type": "input",
+                "block_id": "price_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Price filter"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "price_select",
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Choose a price filter",
+                    },
+                    "initial_option": {
+                        "text": {"type": "plain_text", "text": "Any price"},
+                        "value": "any",
+                    },
+                    "options": price_options,
+                },
+            },
         ],
     }
 
@@ -219,7 +283,14 @@ def build_error_modal(message):
     }
 
 
-def build_results_modal(session_id, search_text, status_filter, subscriptions):
+def build_results_modal(
+    session_id,
+    search_text,
+    status_filter,
+    price_filter,
+    refund_on_cancel,
+    subscriptions,
+):
     option_list = []
     for subscription in subscriptions:
         email = subscription["email"]
@@ -236,6 +307,7 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
 
     filter_text = search_text or "(no filter)"
     status_text = status_filter or "all"
+    price_text = price_filter or "any"
     return {
         "type": "modal",
         "callback_id": RESULTS_MODAL_CALLBACK,
@@ -252,7 +324,9 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
                     "text": (
                         f"*Matches:* {len(subscriptions)}\n"
                         f"*Email filter:* `{filter_text}`\n"
-                        f"*Status filter:* `{status_text}`"
+                        f"*Status filter:* `{status_text}`\n"
+                        f"*Price filter:* `{price_text}`\n"
+                        f"*Auto-refund on cancel:* `{refund_on_cancel}`"
                     ),
                 },
             },
@@ -274,11 +348,18 @@ def build_results_modal(session_id, search_text, status_filter, subscriptions):
     }
 
 
-def build_confirmation_modal(session_id, subscriptions):
+def build_confirmation_modal(session_id, subscriptions, refund_on_cancel):
     lines = []
     for subscription in subscriptions[:10]:
+        price_usd_cents = subscription.get("price_usd_cents")
+        price_text = (
+            f"${price_usd_cents / 100:.2f}"
+            if isinstance(price_usd_cents, int)
+            else "n/a"
+        )
+        refund_text = "refund" if refund_on_cancel and subscription.get("refund_eligible") else "no refund"
         lines.append(
-            f"`{subscription['subscription_id']}` | {subscription['status']} | {subscription['email']}"
+            f"`{subscription['subscription_id']}` | {subscription['status']} | {price_text} | {refund_text} | {subscription['email']}"
         )
 
     if len(subscriptions) > 10:
@@ -289,7 +370,11 @@ def build_confirmation_modal(session_id, subscriptions):
         "type": "modal",
         "callback_id": CONFIRM_MODAL_CALLBACK,
         "private_metadata": json.dumps(
-            {"session_id": session_id, "subscription_ids": selected_ids}
+            {
+                "session_id": session_id,
+                "subscription_ids": selected_ids,
+                "refund_on_cancel": refund_on_cancel,
+            }
         ),
         "notify_on_close": True,
         "title": {"type": "plain_text", "text": "Confirm Cancel"},
@@ -302,6 +387,7 @@ def build_confirmation_modal(session_id, subscriptions):
                     "type": "mrkdwn",
                     "text": (
                         f"*You are about to cancel {len(subscriptions)} subscription(s):*\n"
+                        f"*Automatic refund mode:* `{refund_on_cancel}`\n"
                         + "\n".join(lines)
                     ),
                 },
@@ -315,13 +401,25 @@ def build_status_modal(results):
         results = [results]
 
     success_count = sum(1 for result in results if result["verification"]["verified"])
+    error_count = sum(1 for result in results if result.get("error"))
     summary_lines = []
     for result in results[:10]:
+        if result.get("error"):
+            summary_lines.append(
+                f"`{result['subscription_id']}` | error | {result['error']}"
+            )
+            continue
+
         verification = result["verification"]
         response = result["response"]
+        refund = result.get("refund", {})
         status_line = "verified" if verification["verified"] else "not verified"
+        if refund.get("attempted"):
+            refund_line = "refund created" if refund.get("refunded") else "refund failed"
+        else:
+            refund_line = "no refund"
         summary_lines.append(
-            f"`{response['subscription_id']}` | {response['status']} | {status_line}"
+            f"`{response['subscription_id']}` | {response['status']} | {status_line} | {refund_line}"
         )
 
     if len(results) > 10:
@@ -339,6 +437,7 @@ def build_status_modal(results):
                     "type": "mrkdwn",
                     "text": (
                         f"*Cancellation completed:* {success_count}/{len(results)} verified\n"
+                        f"*Errors:* {error_count}\n"
                         + "\n".join(summary_lines)
                     ),
                 },
@@ -386,6 +485,12 @@ def handle_search_submission(ack, body, client, logger):
         .get("selected_option", {})
         .get("value", "all")
     )
+    price_filter = (
+        values["price_block"]["price_select"]
+        .get("selected_option", {})
+        .get("value", "any")
+    )
+    refund_on_cancel = price_filter == "over_5_usd"
     view_id = body["view"]["id"]
     user_id = body["user"]["id"]
 
@@ -400,7 +505,12 @@ def handle_search_submission(ack, body, client, logger):
     try:
         validate_api_key(api_key)
         subscriptions = get_all_subscriptions(api_key)
-        filtered = filter_subscriptions(subscriptions, search_text, status_filter)
+        filtered = filter_subscriptions(
+            subscriptions,
+            search_text,
+            status_filter,
+            price_filter,
+        )
 
         if not filtered:
             client.views_update(
@@ -423,6 +533,8 @@ def handle_search_submission(ack, body, client, logger):
             api_key,
             search_text,
             status_filter,
+            price_filter,
+            refund_on_cancel,
             filtered,
         )
         session = get_session(session_id, user_id)
@@ -432,6 +544,8 @@ def handle_search_submission(ack, body, client, logger):
                 session_id,
                 search_text,
                 session["status_filter"],
+                session["price_filter"],
+                session["refund_on_cancel"],
                 session["subscriptions"],
             ),
         )
@@ -483,7 +597,14 @@ def handle_results_submission(ack, body):
         delete_session(session_id)
         return
 
-    ack(response_action="update", view=build_confirmation_modal(session_id, selected))
+    ack(
+        response_action="update",
+        view=build_confirmation_modal(
+            session_id,
+            selected,
+            session["refund_on_cancel"],
+        ),
+    )
 
 
 @app.view(CONFIRM_MODAL_CALLBACK)
@@ -491,6 +612,7 @@ def handle_confirmation_submission(ack, body, client, logger):
     metadata = json.loads(body["view"]["private_metadata"])
     session_id = metadata["session_id"]
     subscription_ids = metadata["subscription_ids"]
+    refund_on_cancel = metadata.get("refund_on_cancel", False)
     user_id = body["user"]["id"]
     view_id = body["view"]["id"]
     session = get_session(session_id, user_id)
@@ -513,18 +635,24 @@ def handle_confirmation_submission(ack, body, client, logger):
     try:
         results = []
         for subscription_id in subscription_ids:
-            results.append(cancel_subscription(session["api_key"], subscription_id))
+            try:
+                results.append(
+                    cancel_subscription(
+                        session["api_key"],
+                        subscription_id,
+                        refund_on_cancel=refund_on_cancel,
+                    )
+                )
+            except stripe.error.StripeError as error:
+                results.append(
+                    {
+                        "subscription_id": subscription_id,
+                        "error": getattr(error, "user_message", None) or str(error),
+                        "verification": {"verified": False},
+                    }
+                )
         delete_session(session_id)
         client.views_update(view_id=view_id, view=build_status_modal(results))
-    except stripe.error.StripeError as error:
-        message = getattr(error, "user_message", None) or str(error)
-        delete_session(session_id)
-        client.views_update(
-            view_id=view_id,
-            view=build_error_modal(
-                f"Stripe could not cancel the selected subscriptions: {message}"
-            ),
-        )
     except Exception as error:
         logger.exception("Unhandled Stripe cancellation error")
         delete_session(session_id)
