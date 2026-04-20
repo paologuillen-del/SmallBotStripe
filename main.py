@@ -9,7 +9,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from stripe_service import (
     cancel_subscription,
-    filter_subscriptions_by_email,
+    filter_subscriptions,
     get_all_subscriptions,
     validate_api_key,
 )
@@ -20,6 +20,17 @@ RESULTS_MODAL_CALLBACK = "stripe_results_modal"
 CONFIRM_MODAL_CALLBACK = "stripe_confirm_modal"
 MAX_RESULTS = 100
 SESSION_TTL_SECONDS = 900
+STATUS_OPTIONS = [
+    ("all", "All"),
+    ("active", "Active"),
+    ("canceled", "Canceled"),
+    ("trialing", "Trialing"),
+    ("past_due", "Past due"),
+    ("unpaid", "Unpaid"),
+    ("paused", "Paused"),
+    ("incomplete", "Incomplete"),
+    ("incomplete_expired", "Incomplete expired"),
+]
 
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()
@@ -44,7 +55,7 @@ def cleanup_expired_sessions():
             del SESSIONS[session_id]
 
 
-def store_session(user_id, api_key, search_text, subscriptions):
+def store_session(user_id, api_key, search_text, status_filter, subscriptions):
     cleanup_expired_sessions()
     session_id = uuid.uuid4().hex
     summaries = [serialize_for_slack(subscription) for subscription in subscriptions]
@@ -54,6 +65,7 @@ def store_session(user_id, api_key, search_text, subscriptions):
             "user_id": user_id,
             "api_key": api_key,
             "search_text": search_text,
+            "status_filter": status_filter,
             "subscriptions": summaries,
             "updated_at": time.time(),
         }
@@ -99,6 +111,15 @@ def shorten(text, limit):
 
 
 def build_search_modal():
+    status_options = []
+    for value, label in STATUS_OPTIONS:
+        status_options.append(
+            {
+                "text": {"type": "plain_text", "text": label},
+                "value": value,
+            }
+        )
+
     return {
         "type": "modal",
         "callback_id": SEARCH_MODAL_CALLBACK,
@@ -144,6 +165,25 @@ def build_search_modal():
                     },
                 },
             },
+            {
+                "type": "input",
+                "block_id": "status_block",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Subscription status"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "status_select",
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Choose a status",
+                    },
+                    "initial_option": {
+                        "text": {"type": "plain_text", "text": "All"},
+                        "value": "all",
+                    },
+                    "options": status_options,
+                },
+            },
         ],
     }
 
@@ -178,7 +218,7 @@ def build_error_modal(message):
     }
 
 
-def build_results_modal(session_id, search_text, subscriptions):
+def build_results_modal(session_id, search_text, status_filter, subscriptions):
     option_list = []
     for subscription in subscriptions:
         email = subscription["email"]
@@ -194,6 +234,7 @@ def build_results_modal(session_id, search_text, subscriptions):
         )
 
     filter_text = search_text or "(no filter)"
+    status_text = status_filter or "all"
     return {
         "type": "modal",
         "callback_id": RESULTS_MODAL_CALLBACK,
@@ -209,7 +250,8 @@ def build_results_modal(session_id, search_text, subscriptions):
                     "type": "mrkdwn",
                     "text": (
                         f"*Matches:* {len(subscriptions)}\n"
-                        f"*Email filter:* `{filter_text}`"
+                        f"*Email filter:* `{filter_text}`\n"
+                        f"*Status filter:* `{status_text}`"
                     ),
                 },
             },
@@ -350,6 +392,11 @@ def handle_search_submission(ack, body, client, logger):
     api_key = values["api_key_block"]["api_key_input"]["value"].strip()
     raw_search_text = values["search_text_block"]["search_text_input"].get("value")
     search_text = (raw_search_text or "").strip()
+    status_filter = (
+        values["status_block"]["status_select"]
+        .get("selected_option", {})
+        .get("value", "all")
+    )
     view_id = body["view"]["id"]
     user_id = body["user"]["id"]
 
@@ -364,13 +411,13 @@ def handle_search_submission(ack, body, client, logger):
     try:
         validate_api_key(api_key)
         subscriptions = get_all_subscriptions(api_key)
-        filtered = filter_subscriptions_by_email(subscriptions, search_text)
+        filtered = filter_subscriptions(subscriptions, search_text, status_filter)
 
         if not filtered:
             client.views_update(
                 view_id=view_id,
                 view=build_error_modal(
-                    "No subscriptions matched that email text. Run the command again."
+                    "No subscriptions matched that search. Run the command again."
                 ),
             )
             return
@@ -382,11 +429,22 @@ def handle_search_submission(ack, body, client, logger):
             )
             return
 
-        session_id = store_session(user_id, api_key, search_text, filtered)
+        session_id = store_session(
+            user_id,
+            api_key,
+            search_text,
+            status_filter,
+            filtered,
+        )
         session = get_session(session_id, user_id)
         client.views_update(
             view_id=view_id,
-            view=build_results_modal(session_id, search_text, session["subscriptions"]),
+            view=build_results_modal(
+                session_id,
+                search_text,
+                session["status_filter"],
+                session["subscriptions"],
+            ),
         )
     except stripe.error.StripeError as error:
         message = getattr(error, "user_message", None) or str(error)

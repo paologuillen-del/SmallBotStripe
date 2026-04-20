@@ -65,6 +65,19 @@ def filter_subscriptions_by_email(subscriptions, search_text):
     return filtered
 
 
+def filter_subscriptions(subscriptions, search_text="", status_filter="all"):
+    filtered = filter_subscriptions_by_email(subscriptions, search_text)
+
+    if not status_filter or status_filter == "all":
+        return filtered
+
+    return [
+        subscription
+        for subscription in filtered
+        if getattr(subscription, "status", None) == status_filter
+    ]
+
+
 def print_subscription_summary(subscriptions):
     print(f"\nTotal subscriptions retrieved: {len(subscriptions)}")
     status_counts = Counter(sub.status for sub in subscriptions)
