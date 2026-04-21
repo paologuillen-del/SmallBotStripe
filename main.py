@@ -10,6 +10,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from stripe_service import (
     cancel_subscription,
+    filter_subscriptions,
+    get_all_subscriptions,
     get_latest_invoice_final_usd_cents,
     is_refund_eligible,
     search_subscriptions_by_customer_email,
@@ -21,6 +23,8 @@ SEARCH_MODAL_CALLBACK = "stripe_search_modal"
 RESULTS_MODAL_CALLBACK = "stripe_results_modal"
 CONFIRM_MODAL_CALLBACK = "stripe_confirm_modal"
 SELECT_ALL_ACTION_ID = "select_all_matches"
+SUBSCRIPTION_GROUP_PREFIX = "subscription_group_"
+SUBSCRIPTION_GROUP_ACTION_ID = "subscription_group_select"
 MAX_RESULTS = 100
 SESSION_TTL_SECONDS = 900
 REQUIRED_EMAIL_TEXT = "openloophealth"
@@ -247,22 +251,56 @@ def build_results_modal(
     subscriptions,
     external_id=None,
 ):
-    option_list = []
-    for subscription in subscriptions:
-        email = subscription["email"]
-        label = shorten(
-            f"{email} | {subscription['status']} | {subscription['subscription_id']}",
-            75,
-        )
-        option_list.append(
+    filter_text = search_text or "(no filter)"
+    status_text = status_filter or "all"
+    subscription_blocks = []
+
+    for group_index, start in enumerate(range(0, len(subscriptions), 10), start=1):
+        group_subscriptions = subscriptions[start : start + 10]
+        options = []
+
+        for subscription in group_subscriptions:
+            email = subscription["email"]
+            price_usd_cents = subscription.get("price_usd_cents")
+            price_text = (
+                f"${price_usd_cents / 100:.2f}"
+                if isinstance(price_usd_cents, int)
+                else "n/a"
+            )
+            refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
+            label = shorten(
+                f"{email} | {subscription['status']} | {subscription['subscription_id']}",
+                75,
+            )
+            description = shorten(
+                f"{price_text} | {refund_text}",
+                75,
+            )
+            options.append(
+                {
+                    "text": {"type": "plain_text", "text": label},
+                    "value": subscription["subscription_id"],
+                    "description": {"type": "plain_text", "text": description},
+                }
+            )
+
+        subscription_blocks.append(
             {
-                "text": {"type": "plain_text", "text": label},
-                "value": subscription["subscription_id"],
+                "type": "input",
+                "optional": True,
+                "block_id": f"{SUBSCRIPTION_GROUP_PREFIX}{group_index}",
+                "label": {
+                    "type": "plain_text",
+                    "text": f"Subscriptions {start + 1}-{start + len(group_subscriptions)}",
+                },
+                "element": {
+                    "type": "checkboxes",
+                    "action_id": SUBSCRIPTION_GROUP_ACTION_ID,
+                    "options": options,
+                },
             }
         )
 
-    filter_text = search_text or "(no filter)"
-    status_text = status_filter or "all"
     return add_external_id({
         "type": "modal",
         "callback_id": RESULTS_MODAL_CALLBACK,
@@ -304,20 +342,7 @@ def build_results_modal(
                     ],
                 },
             },
-            {
-                "type": "input",
-                "block_id": "subscription_block",
-                "label": {"type": "plain_text", "text": "Subscriptions"},
-                "element": {
-                    "type": "multi_static_select",
-                    "action_id": "subscription_select",
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "Choose one or more subscriptions",
-                    },
-                    "options": option_list,
-                },
-            },
+            *subscription_blocks,
         ],
     }, external_id)
 
@@ -506,6 +531,17 @@ def handle_search_submission(ack, body, client, logger):
             REQUIRED_EMAIL_TEXT,
             MAX_RESULTS + 1,
         )
+        if not filtered:
+            logger.info(
+                "Fast customer-email search returned no matches; falling back to full subscription scan."
+            )
+            subscriptions = get_all_subscriptions(api_key)
+            filtered = filter_subscriptions(
+                subscriptions,
+                search_text,
+                status_filter,
+                REQUIRED_EMAIL_TEXT,
+            )
 
         if not filtered:
             client.views_update(
@@ -593,11 +629,16 @@ def handle_results_submission(ack, body):
         )
         return
 
-    selected_options = (
-        body["view"]["state"]["values"]["subscription_block"]["subscription_select"]
-        .get("selected_options", [])
-    )
-    selected_ids = [option["value"] for option in selected_options]
+    selected_ids = []
+    state_values = body["view"]["state"]["values"]
+    for block_id, actions in state_values.items():
+        if not block_id.startswith(SUBSCRIPTION_GROUP_PREFIX):
+            continue
+        selected_options = actions[SUBSCRIPTION_GROUP_ACTION_ID].get(
+            "selected_options",
+            [],
+        )
+        selected_ids.extend(option["value"] for option in selected_options)
 
     selected = []
     for subscription in session["subscriptions"]:
