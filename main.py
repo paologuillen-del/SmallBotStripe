@@ -37,7 +37,6 @@ REQUIRED_EMAIL_TEXT = "openloophealth"
 STATUS_OPTIONS = [
     ("all", "All"),
     ("active", "Active"),
-    ("canceled", "Canceled"),
     ("trialing", "Trialing"),
     ("past_due", "Past due"),
     ("unpaid", "Unpaid"),
@@ -129,6 +128,14 @@ def serialize_for_slack(subscription):
     }
 
 
+def filter_retrievable_subscription_summaries(subscriptions):
+    return [
+        subscription
+        for subscription in subscriptions
+        if subscription.get("status") != "canceled"
+    ]
+
+
 def load_subscription_summaries(api_key, search_text, status_filter, logger):
     try:
         subscriptions = search_subscriptions_by_customer_email(
@@ -140,7 +147,9 @@ def load_subscription_summaries(api_key, search_text, status_filter, logger):
             subscription_expand=LIST_EXPAND_LIGHT,
         )
         if subscriptions:
-            return [serialize_for_slack(subscription) for subscription in subscriptions]
+            return filter_retrievable_subscription_summaries(
+                [serialize_for_slack(subscription) for subscription in subscriptions]
+            )
 
         logger.info(
             "Fast customer-email search returned no matches; falling back to full subscription scan."
@@ -177,7 +186,9 @@ def load_subscription_summaries(api_key, search_text, status_filter, logger):
         status_filter,
         REQUIRED_EMAIL_TEXT,
     )
-    return [serialize_for_slack(subscription) for subscription in filtered]
+    return filter_retrievable_subscription_summaries(
+        [serialize_for_slack(subscription) for subscription in filtered]
+    )
 
 
 def load_detailed_subscriptions(api_key, subscription_summaries):
@@ -653,7 +664,6 @@ def build_confirmation_modal(session_id, subscriptions, external_id=None):
                     "type": "mrkdwn",
                     "text": (
                         f"*You are about to cancel {len(subscriptions)} subscription(s):*\n"
-                        "*Automatic refund mode:* `latest invoice total > $5 USD`\n"
                         + "\n".join(lines)
                     ),
                 },
