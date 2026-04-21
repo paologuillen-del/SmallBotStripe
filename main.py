@@ -21,6 +21,7 @@ from stripe_service import (
 SEARCH_MODAL_CALLBACK = "stripe_search_modal"
 RESULTS_MODAL_CALLBACK = "stripe_results_modal"
 CONFIRM_MODAL_CALLBACK = "stripe_confirm_modal"
+SELECT_ALL_ACTION_ID = "select_all_matches"
 MAX_RESULTS = 100
 SESSION_TTL_SECONDS = 900
 STATUS_OPTIONS = [
@@ -276,6 +277,25 @@ def build_results_modal(
             },
             {
                 "type": "input",
+                "optional": True,
+                "block_id": "select_all_block",
+                "label": {"type": "plain_text", "text": "Bulk action"},
+                "element": {
+                    "type": "checkboxes",
+                    "action_id": SELECT_ALL_ACTION_ID,
+                    "options": [
+                        {
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Select all matches",
+                            },
+                            "value": "all",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "input",
                 "block_id": "subscription_block",
                 "label": {"type": "plain_text", "text": "Subscriptions"},
                 "element": {
@@ -527,6 +547,20 @@ def handle_results_submission(ack, body):
         ack(
             response_action="update",
             view=build_error_modal("That session expired. Run the command again."),
+        )
+        return
+
+    selected_all = (
+        body["view"]["state"]["values"]["select_all_block"][SELECT_ALL_ACTION_ID]
+        .get("selected_options", [])
+    )
+    if selected_all:
+        ack(
+            response_action="update",
+            view=build_confirmation_modal(
+                session_id,
+                session["subscriptions"],
+            ),
         )
         return
 
