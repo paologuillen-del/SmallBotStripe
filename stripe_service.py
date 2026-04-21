@@ -12,20 +12,16 @@ def validate_api_key(api_key):
     stripe.Subscription.list(limit=1, status="all", api_key=api_key)
 
 
-def get_all_subscriptions(api_key):
+def get_all_subscriptions(api_key, status_filter="all", expand=None):
     all_subscriptions = []
     starting_after = None
+    expand = LIST_EXPAND_FULL if expand is None else expand
 
     while True:
         params = {
             "limit": PAGE_SIZE,
-            "expand": [
-                "data.customer",
-                "data.items.data.price",
-                "data.latest_invoice.charge",
-                "data.latest_invoice.payment_intent",
-            ],
-            "status": "all",
+            "expand": expand,
+            "status": status_filter or "all",
             "api_key": api_key,
         }
 
@@ -283,16 +279,7 @@ def print_subscription_list(subscriptions):
 
 
 def cancel_subscription(api_key, subscription_id):
-    subscription = stripe.Subscription.retrieve(
-        subscription_id,
-        api_key=api_key,
-        expand=[
-            "customer",
-            "items.data.price",
-            "latest_invoice.charge",
-            "latest_invoice.payment_intent",
-        ],
-    )
+    subscription = get_subscription_details(api_key, subscription_id)
     response = stripe.Subscription.delete(subscription_id, api_key=api_key)
     verified = stripe.Subscription.retrieve(
         subscription_id,
