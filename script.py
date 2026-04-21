@@ -81,13 +81,13 @@ def handle_results(api_key, subscriptions):
         return
 
     result = cancel_subscription(api_key, selected.id)
-    print("\nStripe cancellation response:")
+    print("\nStripe processing response:")
     print(result["response"])
     print("\nVerification result:")
     print(result["verification"])
 
     if not result["verification"]["verified"]:
-        print("Warning: Stripe did not return a canceled status on verification.")
+        print("Warning: the requested action did not complete successfully.")
 
 
 def main():

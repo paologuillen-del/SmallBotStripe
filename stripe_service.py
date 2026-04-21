@@ -1,3 +1,6 @@
+import json
+import os
+from urllib import error, request
 from collections import Counter
 
 import stripe
@@ -6,6 +9,7 @@ import stripe
 PAGE_SIZE = 100
 OVER_FIVE_USD_CENTS = 500
 REQUIRED_EMAIL_TEXT = "openloophealth"
+HIGH_VALUE_NOTIFICATION_WEBHOOK_ENV = "HIGH_VALUE_SLACK_WEBHOOK_URL"
 LIST_EXPAND_FULL = [
     "data.customer",
     "data.items.data.price",
@@ -207,7 +211,7 @@ def serialize_subscription(subscription):
         "email": get_customer_email(subscription) or "(no email)",
         "current_period_end": getattr(subscription, "current_period_end", None),
         "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
-        "refund_eligible": is_refund_eligible(subscription),
+        "notification_required": requires_high_value_notification(subscription),
     }
 
 
@@ -249,9 +253,38 @@ def get_latest_invoice_final_usd_cents(subscription):
     return total
 
 
-def is_refund_eligible(subscription):
+def requires_high_value_notification(subscription):
     price_usd_cents = get_latest_invoice_final_usd_cents(subscription)
     return price_usd_cents is not None and price_usd_cents > OVER_FIVE_USD_CENTS
+
+
+def send_high_value_subscription_notification(webhook_url, subscription):
+    details = serialize_subscription(subscription)
+    price_usd_cents = details["price_usd_cents"]
+    price_text = (
+        f"${price_usd_cents / 100:.2f}"
+        if isinstance(price_usd_cents, int)
+        else "n/a"
+    )
+    payload = {
+        "text": (
+            "High-value Stripe subscription requires manual review instead of cancellation.\n"
+            f"Subscription: {details['subscription_id']}\n"
+            f"Status: {details['status']}\n"
+            f"Email: {details['email']}\n"
+            f"Customer ID: {details['customer_id'] or 'n/a'}\n"
+            f"Final invoice total: {price_text}"
+        )
+    }
+    request_data = json.dumps(payload).encode("utf-8")
+    slack_request = request.Request(
+        webhook_url,
+        data=request_data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(slack_request, timeout=15) as response:
+        response.read()
 
 
 def filter_subscriptions(
@@ -300,71 +333,72 @@ def print_subscription_list(subscriptions):
 
 def cancel_subscription(api_key, subscription_id):
     subscription = get_subscription_details(api_key, subscription_id)
-    response = stripe.Subscription.delete(subscription_id, api_key=api_key)
-    verified = stripe.Subscription.retrieve(
-        subscription_id,
-        api_key=api_key,
-        expand=["customer"],
-    )
-    refund_details = {
+    notification_details = {
         "attempted": False,
-        "eligible": is_refund_eligible(subscription),
-        "refunded": False,
+        "required": requires_high_value_notification(subscription),
+        "sent": False,
         "reason": None,
-        "refund_id": None,
         "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
     }
-
-    if refund_details["eligible"]:
-        refund_details["attempted"] = True
-        latest_invoice = getattr(subscription, "latest_invoice", None)
-        payment_intent = (
-            getattr(latest_invoice, "payment_intent", None) if latest_invoice else None
-        )
-        payment_intent_id = getattr(payment_intent, "id", payment_intent)
-        charge = getattr(latest_invoice, "charge", None) if latest_invoice else None
-        charge_id = getattr(charge, "id", charge)
-
-        if payment_intent_id or charge_id:
-            try:
-                refund_params = {
-                    "api_key": api_key,
-                    "reason": "requested_by_customer",
-                }
-                if payment_intent_id:
-                    refund_params["payment_intent"] = payment_intent_id
-                else:
-                    refund_params["charge"] = charge_id
-
-                refund = stripe.Refund.create(**refund_params)
-                refund_details["refunded"] = True
-                refund_details["refund_id"] = refund.id
-            except stripe.error.StripeError as error:
-                refund_details["reason"] = (
-                    getattr(error, "user_message", None) or str(error)
-                )
-        else:
-            refund_details["reason"] = (
-                "No latest invoice payment record available for refund."
+    if notification_details["required"]:
+        notification_details["attempted"] = True
+        webhook_url = os.environ.get(HIGH_VALUE_NOTIFICATION_WEBHOOK_ENV, "").strip()
+        if not webhook_url:
+            notification_details["reason"] = (
+                f"Missing {HIGH_VALUE_NOTIFICATION_WEBHOOK_ENV} environment variable."
             )
+        else:
+            try:
+                send_high_value_subscription_notification(webhook_url, subscription)
+                notification_details["sent"] = True
+            except (OSError, error.URLError) as notify_error:
+                notification_details["reason"] = str(notify_error)
 
-    response_details = {
-        "subscription_id": response.id,
-        "status": response.status,
-        "canceled_at": getattr(response, "canceled_at", None),
-        "customer_id": getattr(response, "customer", None),
-    }
-
-    verification_details = {
-        "subscription_id": verified.id,
-        "status": verified.status,
-        "email": get_customer_email(verified) or "(no email)",
-        "canceled_at": getattr(verified, "canceled_at", None),
-        "verified": verified.status == "canceled",
-    }
+        verified = stripe.Subscription.retrieve(
+            subscription_id,
+            api_key=api_key,
+            expand=["customer"],
+        )
+        response_details = {
+            "subscription_id": verified.id,
+            "status": verified.status,
+            "canceled_at": getattr(verified, "canceled_at", None),
+            "customer_id": getattr(verified, "customer", None),
+            "action": "notified" if notification_details["sent"] else "notification_failed",
+        }
+        verification_details = {
+            "subscription_id": verified.id,
+            "status": verified.status,
+            "email": get_customer_email(verified) or "(no email)",
+            "canceled_at": getattr(verified, "canceled_at", None),
+            "verified": notification_details["sent"],
+            "mode": "notified",
+        }
+    else:
+        response = stripe.Subscription.delete(subscription_id, api_key=api_key)
+        verified = stripe.Subscription.retrieve(
+            subscription_id,
+            api_key=api_key,
+            expand=["customer"],
+        )
+        response_details = {
+            "subscription_id": response.id,
+            "status": response.status,
+            "canceled_at": getattr(response, "canceled_at", None),
+            "customer_id": getattr(response, "customer", None),
+            "action": "canceled",
+        }
+        verification_details = {
+            "subscription_id": verified.id,
+            "status": verified.status,
+            "email": get_customer_email(verified) or "(no email)",
+            "canceled_at": getattr(verified, "canceled_at", None),
+            "verified": verified.status == "canceled",
+            "mode": "canceled",
+        }
 
     return {
         "response": response_details,
         "verification": verification_details,
-        "refund": refund_details,
+        "notification": notification_details,
     }

@@ -26,6 +26,7 @@ Set these environment variables:
 
 - `SLACK_BOT_TOKEN`
 - `SLACK_APP_TOKEN`
+- `HIGH_VALUE_SLACK_WEBHOOK_URL`
 
 Then run:
 
@@ -54,12 +55,12 @@ No `users:*` OAuth scopes are required.
 2. Paste the Stripe restricted key into the modal.
 3. Review or edit the prefilled email text filter.
 4. Pick one matching subscription.
-5. Confirm cancellation.
-6. Review the Stripe result, verification status, and any automatic refund result.
+5. Confirm processing.
+6. Review the Stripe result and verification status.
 
 ## Security Notes
 
 - The Slack app keeps the pasted Stripe restricted key only in memory for the active workflow session.
 - The app deletes the in-memory session after cancellation or when the modal is closed.
 - Slack modal inputs are not masked like password fields, so use restricted keys only.
-- If the latest subscription invoice total after discounts is more than `$5 USD`, the app also attempts a refund for that latest invoice payment.
+- If the latest subscription invoice total after discounts is more than `$5 USD`, the app sends a Slack notification to `HIGH_VALUE_SLACK_WEBHOOK_URL` instead of canceling that subscription.

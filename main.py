@@ -444,8 +444,10 @@ def build_results_modal(
                     if isinstance(price_usd_cents, int)
                     else "n/a"
                 )
-                refund_text = (
-                    "refund" if subscription.get("refund_eligible") else "no refund"
+                action_text = (
+                    "notify Slack"
+                    if subscription.get("notification_required")
+                    else "can cancel"
                 )
                 label = shorten(
                     f"{email} | {subscription['status']} | {subscription['subscription_id']}",
@@ -457,7 +459,7 @@ def build_results_modal(
                         "value": subscription["subscription_id"],
                         "description": {
                             "type": "plain_text",
-                            "text": shorten(f"{price_text} | {refund_text}", 75),
+                            "text": shorten(f"{price_text} | {action_text}", 75),
                         },
                     }
                 )
@@ -586,7 +588,7 @@ def build_results_modal(
                         f"*Email filter:* `{filter_text}`\n"
                         f"*Required email text:* `{REQUIRED_EMAIL_TEXT}`\n"
                         f"*Status filter:* `{status_text}`\n"
-                        "*Auto-refund on cancel:* `latest invoice total > $5 USD`"
+                        "*Over $5 final invoice total:* sent to Slack instead of canceled"
                     ),
                 },
             },
@@ -635,9 +637,13 @@ def build_confirmation_modal(session_id, subscriptions, external_id=None):
             if isinstance(price_usd_cents, int)
             else "n/a"
         )
-        refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
+        action_text = (
+            "notify Slack"
+            if subscription.get("notification_required")
+            else "cancel"
+        )
         lines.append(
-            f"`{subscription['subscription_id']}` | {subscription['status']} | {price_text} | {refund_text} | {subscription['email']}"
+            f"`{subscription['subscription_id']}` | {subscription['status']} | {price_text} | {action_text} | {subscription['email']}"
         )
 
     if len(subscriptions) > 10:
@@ -654,8 +660,8 @@ def build_confirmation_modal(session_id, subscriptions, external_id=None):
             }
         ),
         "notify_on_close": True,
-        "title": {"type": "plain_text", "text": "Confirm Cancel"},
-        "submit": {"type": "plain_text", "text": "Cancel selected"},
+        "title": {"type": "plain_text", "text": "Confirm Processing"},
+        "submit": {"type": "plain_text", "text": "Process selected"},
         "close": {"type": "plain_text", "text": "Close"},
         "blocks": [
             {
@@ -663,7 +669,7 @@ def build_confirmation_modal(session_id, subscriptions, external_id=None):
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"*You are about to cancel {len(subscriptions)} subscription(s):*\n"
+                        f"*You are about to process {len(subscriptions)} subscription(s):*\n"
                         + "\n".join(lines)
                     ),
                 },
@@ -692,14 +698,18 @@ def build_status_modal(results, external_id=None):
 
         verification = result["verification"]
         response = result["response"]
-        refund = result.get("refund", {})
-        status_line = "verified" if verification["verified"] else "not verified"
-        if refund.get("attempted"):
-            refund_line = "refund created" if refund.get("refunded") else "refund failed"
+        notification = result.get("notification", {})
+        mode = verification.get("mode", "canceled")
+        status_line = "completed" if verification["verified"] else "failed"
+        if mode == "notified":
+            if notification.get("sent"):
+                action_line = "sent to Slack"
+            else:
+                action_line = "Slack notification failed"
         else:
-            refund_line = "no refund"
+            action_line = "canceled"
         summary_lines.append(
-            f"`{response['subscription_id']}` | {response['status']} | {status_line} | {refund_line}"
+            f"`{response['subscription_id']}` | {response['status']} | {status_line} | {action_line}"
         )
 
     if len(results) > 10:
@@ -716,7 +726,7 @@ def build_status_modal(results, external_id=None):
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"*Cancellation completed:* {success_count}/{len(results)} verified\n"
+                        f"*Completed:* {success_count}/{len(results)}\n"
                         f"*Errors:* {error_count}\n"
                         + "\n".join(summary_lines)
                     ),
@@ -1030,8 +1040,8 @@ def handle_confirmation_submission(ack, body, client, logger):
     ack(
         response_action="update",
         view=build_loading_modal(
-            "Cancelling",
-            f"Cancelling {len(subscription_ids)} subscription(s) and verifying the Stripe response.",
+            "Processing",
+            f"Processing {len(subscription_ids)} subscription(s) and verifying the result.",
             external_id=view_external_id,
         ),
     )
