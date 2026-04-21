@@ -339,22 +339,8 @@ def build_confirmation_modal(session_id, subscriptions):
     }
 
 
-def get_default_search_text(client, user_id, logger):
-    try:
-        user = client.users_info(user=user_id)["user"]
-    except Exception as error:
-        logger.warning("Unable to load Slack user info for search prefill: %s", error)
-        return ""
-
-    email = (
-        user.get("profile", {}).get("email")
-        if isinstance(user, dict)
-        else getattr(getattr(user, "profile", None), "email", None)
-    )
-    if not email or "@" not in email:
-        return ""
-
-    return email.split("@", 1)[0]
+def get_default_search_text():
+    return "openloophealth"
 
 
 def build_status_modal(results):
@@ -430,9 +416,9 @@ def build_too_many_results_modal(count):
 
 
 @app.command("/stripe-subscriptions")
-def open_stripe_modal(ack, body, client, logger):
+def open_stripe_modal(ack, body, client):
     ack()
-    default_search_text = get_default_search_text(client, body["user_id"], logger)
+    default_search_text = get_default_search_text()
     client.views_open(
         trigger_id=body["trigger_id"],
         view=build_search_modal(default_search_text),
