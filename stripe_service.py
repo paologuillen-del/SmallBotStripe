@@ -5,6 +5,7 @@ import stripe
 
 PAGE_SIZE = 100
 OVER_FIVE_USD_CENTS = 500
+REQUIRED_EMAIL_TEXT = "openloophealth"
 
 
 def validate_api_key(api_key):
@@ -60,14 +61,25 @@ def serialize_subscription(subscription):
     }
 
 
-def filter_subscriptions_by_email(subscriptions, search_text):
+def filter_subscriptions_by_email(
+    subscriptions,
+    search_text,
+    required_text=REQUIRED_EMAIL_TEXT,
+):
     search_text = search_text.lower().strip()
+    required_text = (required_text or "").lower().strip()
     if not search_text:
-        return subscriptions
+        return [
+            subscription
+            for subscription in subscriptions
+            if required_text in (get_customer_email(subscription) or "").lower()
+        ] if required_text else subscriptions
 
     filtered = []
     for subscription in subscriptions:
         email = (get_customer_email(subscription) or "").lower()
+        if required_text and required_text not in email:
+            continue
         if search_text in email:
             filtered.append(subscription)
     return filtered
@@ -96,8 +108,13 @@ def filter_subscriptions(
     subscriptions,
     search_text="",
     status_filter="all",
+    required_email_text=REQUIRED_EMAIL_TEXT,
 ):
-    filtered = filter_subscriptions_by_email(subscriptions, search_text)
+    filtered = filter_subscriptions_by_email(
+        subscriptions,
+        search_text,
+        required_text=required_email_text,
+    )
 
     if status_filter and status_filter != "all":
         filtered = [

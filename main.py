@@ -24,6 +24,7 @@ CONFIRM_MODAL_CALLBACK = "stripe_confirm_modal"
 SELECT_ALL_ACTION_ID = "select_all_matches"
 MAX_RESULTS = 100
 SESSION_TTL_SECONDS = 900
+REQUIRED_EMAIL_TEXT = "openloophealth"
 STATUS_OPTIONS = [
     ("all", "All"),
     ("active", "Active"),
@@ -146,7 +147,9 @@ def build_search_modal(default_search_text=""):
                     "type": "mrkdwn",
                     "text": (
                         "Paste a Stripe restricted key for this one workflow. "
-                        "The app keeps it only in memory until the flow finishes."
+                        "The app keeps it only in memory until the flow finishes.\n"
+                        f"Only subscriptions whose email contains `{REQUIRED_EMAIL_TEXT}` "
+                        "will be shown."
                     ),
                 },
             },
@@ -270,6 +273,7 @@ def build_results_modal(
                     "text": (
                         f"*Matches:* {len(subscriptions)}\n"
                         f"*Email filter:* `{filter_text}`\n"
+                        f"*Required email text:* `{REQUIRED_EMAIL_TEXT}`\n"
                         f"*Status filter:* `{status_text}`\n"
                         "*Auto-refund on cancel:* `latest invoice total > $5 USD`"
                     ),
@@ -359,12 +363,15 @@ def build_confirmation_modal(session_id, subscriptions):
     }
 
 
-def get_default_search_text(client, user_id, logger):
+def get_default_search_text(client, user_id, fallback_username, logger):
     try:
         user = client.users_info(user=user_id)["user"]
     except Exception as error:
-        logger.warning("Unable to load Slack user info for search prefill: %s", error)
-        return ""
+        logger.warning(
+            "Unable to load Slack user info for search prefill, using Slack username: %s",
+            error,
+        )
+        return (fallback_username or "").strip()
 
     email = (
         user.get("profile", {}).get("email")
@@ -452,7 +459,12 @@ def build_too_many_results_modal(count):
 @app.command("/stripe-subscriptions")
 def open_stripe_modal(ack, body, client, logger):
     ack()
-    default_search_text = get_default_search_text(client, body["user_id"], logger)
+    default_search_text = get_default_search_text(
+        client,
+        body["user_id"],
+        body.get("user_name", ""),
+        logger,
+    )
     client.views_open(
         trigger_id=body["trigger_id"],
         view=build_search_modal(default_search_text),
@@ -488,6 +500,7 @@ def handle_search_submission(ack, body, client, logger):
             subscriptions,
             search_text,
             status_filter,
+            REQUIRED_EMAIL_TEXT,
         )
 
         if not filtered:
