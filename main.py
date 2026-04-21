@@ -311,54 +311,72 @@ def build_results_modal(
     search_text,
     status_filter,
     subscriptions,
+    select_all_enabled=False,
     external_id=None,
 ):
     filter_text = search_text or "(no filter)"
     status_text = status_filter or "all"
     subscription_blocks = []
 
-    for group_index, start in enumerate(range(0, len(subscriptions), 10), start=1):
-        group_subscriptions = subscriptions[start : start + 10]
-        options = []
+    if not select_all_enabled:
+        for group_index, start in enumerate(range(0, len(subscriptions), 10), start=1):
+            group_subscriptions = subscriptions[start : start + 10]
+            options = []
 
-        for subscription in group_subscriptions:
-            email = subscription["email"]
-            price_usd_cents = subscription.get("price_usd_cents")
-            price_text = (
-                f"${price_usd_cents / 100:.2f}"
-                if isinstance(price_usd_cents, int)
-                else "n/a"
-            )
-            refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
-            label = shorten(
-                f"{email} | {subscription['status']} | {subscription['subscription_id']}",
-                75,
-            )
-            options.append(
+            for subscription in group_subscriptions:
+                email = subscription["email"]
+                price_usd_cents = subscription.get("price_usd_cents")
+                price_text = (
+                    f"${price_usd_cents / 100:.2f}"
+                    if isinstance(price_usd_cents, int)
+                    else "n/a"
+                )
+                refund_text = (
+                    "refund" if subscription.get("refund_eligible") else "no refund"
+                )
+                label = shorten(
+                    f"{email} | {subscription['status']} | {subscription['subscription_id']}",
+                    75,
+                )
+                options.append(
+                    {
+                        "text": {"type": "plain_text", "text": label},
+                        "value": subscription["subscription_id"],
+                        "description": {
+                            "type": "plain_text",
+                            "text": shorten(f"{price_text} | {refund_text}", 75),
+                        },
+                    }
+                )
+
+            subscription_blocks.append(
                 {
-                    "text": {"type": "plain_text", "text": label},
-                    "value": subscription["subscription_id"],
-                    "description": {
+                    "type": "input",
+                    "optional": True,
+                    "block_id": f"{SUBSCRIPTION_GROUP_PREFIX}{group_index}",
+                    "label": {
                         "type": "plain_text",
-                        "text": shorten(f"{price_text} | {refund_text}", 75),
+                        "text": f"Subscriptions {start + 1}-{start + len(group_subscriptions)}",
+                    },
+                    "element": {
+                        "type": "checkboxes",
+                        "action_id": SUBSCRIPTION_GROUP_ACTION_ID,
+                        "options": options,
                     },
                 }
             )
 
-        subscription_blocks.append(
+    hidden_notice_block = []
+    if select_all_enabled:
+        hidden_notice_block.append(
             {
-                "type": "input",
-                "optional": True,
-                "block_id": f"{SUBSCRIPTION_GROUP_PREFIX}{group_index}",
-                "label": {
-                    "type": "plain_text",
-                    "text": f"Subscriptions {start + 1}-{start + len(group_subscriptions)}",
-                },
-                "element": {
-                    "type": "checkboxes",
-                    "action_id": SUBSCRIPTION_GROUP_ACTION_ID,
-                    "options": options,
-                },
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "Individual subscription checkboxes are hidden while *Select all matches* is enabled.",
+                    }
+                ],
             }
         )
 
@@ -387,11 +405,21 @@ def build_results_modal(
             {
                 "type": "input",
                 "optional": True,
+                "dispatch_action": True,
                 "block_id": "select_all_block",
                 "label": {"type": "plain_text", "text": "Bulk action"},
                 "element": {
                     "type": "checkboxes",
                     "action_id": SELECT_ALL_ACTION_ID,
+                    "initial_options": [
+                        {
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Select all matches",
+                            },
+                            "value": "all",
+                        }
+                    ] if select_all_enabled else [],
                     "options": [
                         {
                             "text": {
@@ -403,6 +431,7 @@ def build_results_modal(
                     ],
                 },
             },
+            *hidden_notice_block,
             *subscription_blocks,
         ],
     }, external_id)
@@ -609,6 +638,7 @@ def handle_search_submission(ack, body, client, logger):
                 search_text,
                 session["status_filter"],
                 session["subscriptions"],
+                select_all_enabled=False,
                 external_id=loading_external_id,
             ),
         )
@@ -630,6 +660,34 @@ def handle_search_submission(ack, body, client, logger):
                 external_id=loading_external_id,
             ),
         )
+
+
+@app.action(SELECT_ALL_ACTION_ID)
+def handle_select_all_toggle(ack, body, client):
+    ack()
+
+    session_id = body["view"]["private_metadata"]
+    user_id = body["user"]["id"]
+    session = get_session(session_id, user_id)
+    if not session:
+        return
+
+    selected_options = body["actions"][0].get("selected_options", [])
+    select_all_enabled = bool(selected_options)
+    view = body["view"]
+
+    client.views_update(
+        view_id=view["id"],
+        hash=view["hash"],
+        view=build_results_modal(
+            session_id,
+            session["search_text"],
+            session["status_filter"],
+            session["subscriptions"],
+            select_all_enabled=select_all_enabled,
+            external_id=view.get("external_id"),
+        ),
+    )
 
 
 @app.view(RESULTS_MODAL_CALLBACK)
