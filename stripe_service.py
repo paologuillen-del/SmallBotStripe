@@ -6,6 +6,19 @@ import stripe
 PAGE_SIZE = 100
 OVER_FIVE_USD_CENTS = 500
 REQUIRED_EMAIL_TEXT = "openloophealth"
+LIST_EXPAND_FULL = [
+    "data.customer",
+    "data.items.data.price",
+    "data.latest_invoice.charge",
+    "data.latest_invoice.payment_intent",
+]
+LIST_EXPAND_LIGHT = ["data.customer"]
+SUBSCRIPTION_EXPAND_FULL = [
+    "customer",
+    "items.data.price",
+    "latest_invoice.charge",
+    "latest_invoice.payment_intent",
+]
 
 
 def validate_api_key(api_key):
@@ -83,20 +96,17 @@ def get_subscriptions_for_customer(
     customer_id,
     status_filter="all",
     max_results=None,
+    expand=None,
 ):
     subscriptions = []
     starting_after = None
+    expand = LIST_EXPAND_FULL if expand is None else expand
 
     while True:
         params = {
             "customer": customer_id,
             "limit": PAGE_SIZE,
-            "expand": [
-                "data.customer",
-                "data.items.data.price",
-                "data.latest_invoice.charge",
-                "data.latest_invoice.payment_intent",
-            ],
+            "expand": expand,
             "status": status_filter or "all",
             "api_key": api_key,
         }
@@ -124,6 +134,7 @@ def search_subscriptions_by_customer_email(
     status_filter="all",
     required_email_text=REQUIRED_EMAIL_TEXT,
     max_results=None,
+    subscription_expand=None,
 ):
     query = build_customer_email_search_query(search_text, required_email_text)
     if not query:
@@ -155,6 +166,7 @@ def search_subscriptions_by_customer_email(
                 customer_id,
                 status_filter=status_filter,
                 max_results=remaining_capacity,
+                expand=subscription_expand,
             )
 
             for subscription in customer_subscriptions:
@@ -171,6 +183,14 @@ def search_subscriptions_by_customer_email(
             break
 
     return subscriptions
+
+
+def get_subscription_details(api_key, subscription_id):
+    return stripe.Subscription.retrieve(
+        subscription_id,
+        api_key=api_key,
+        expand=SUBSCRIPTION_EXPAND_FULL,
+    )
 
 
 def get_customer_email(subscription):

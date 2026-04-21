@@ -12,8 +12,9 @@ from stripe_service import (
     cancel_subscription,
     filter_subscriptions,
     get_all_subscriptions,
-    get_latest_invoice_final_usd_cents,
-    is_refund_eligible,
+    get_subscription_details,
+    LIST_EXPAND_LIGHT,
+    serialize_subscription,
     search_subscriptions_by_customer_email,
     validate_api_key,
 )
@@ -72,7 +73,6 @@ def store_session(
 ):
     cleanup_expired_sessions()
     session_id = uuid.uuid4().hex
-    summaries = [serialize_for_slack(subscription) for subscription in subscriptions]
 
     with SESSIONS_LOCK:
         SESSIONS[session_id] = {
@@ -80,7 +80,7 @@ def store_session(
             "api_key": api_key,
             "search_text": search_text,
             "status_filter": status_filter,
-            "subscriptions": summaries,
+            "subscriptions": subscriptions,
             "updated_at": time.time(),
         }
 
@@ -116,9 +116,71 @@ def serialize_for_slack(subscription):
         "customer_id": getattr(customer, "id", None),
         "email": email or "(no email)",
         "current_period_end": getattr(subscription, "current_period_end", None),
-        "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
-        "refund_eligible": is_refund_eligible(subscription),
     }
+
+
+def load_subscription_summaries(api_key, search_text, status_filter, logger):
+    try:
+        subscriptions = search_subscriptions_by_customer_email(
+            api_key,
+            search_text,
+            status_filter,
+            REQUIRED_EMAIL_TEXT,
+            MAX_RESULTS + 1,
+            subscription_expand=LIST_EXPAND_LIGHT,
+        )
+        if subscriptions:
+            return [serialize_for_slack(subscription) for subscription in subscriptions]
+
+        logger.info(
+            "Fast customer-email search returned no matches; falling back to full subscription scan."
+        )
+    except stripe.error.StripeError as error:
+        logger.warning(
+            "Fast customer-email search failed; falling back to full subscription scan: %s",
+            error,
+        )
+
+    try:
+        subscriptions = get_all_subscriptions(
+            api_key,
+            status_filter=status_filter,
+            expand=LIST_EXPAND_LIGHT,
+        )
+    except stripe.error.StripeError:
+        if status_filter == "all":
+            raise
+
+        logger.warning(
+            "Subscription list rejected status filter %s; retrying with status=all",
+            status_filter,
+        )
+        subscriptions = get_all_subscriptions(
+            api_key,
+            status_filter="all",
+            expand=LIST_EXPAND_LIGHT,
+        )
+
+    filtered = filter_subscriptions(
+        subscriptions,
+        search_text,
+        status_filter,
+        REQUIRED_EMAIL_TEXT,
+    )
+    return [serialize_for_slack(subscription) for subscription in filtered]
+
+
+def load_detailed_subscriptions(api_key, subscription_summaries):
+    detailed_subscriptions = []
+
+    for subscription in subscription_summaries:
+        detailed_subscription = get_subscription_details(
+            api_key,
+            subscription["subscription_id"],
+        )
+        detailed_subscriptions.append(serialize_subscription(detailed_subscription))
+
+    return detailed_subscriptions
 
 
 def shorten(text, limit):
@@ -261,26 +323,14 @@ def build_results_modal(
 
         for subscription in group_subscriptions:
             email = subscription["email"]
-            price_usd_cents = subscription.get("price_usd_cents")
-            price_text = (
-                f"${price_usd_cents / 100:.2f}"
-                if isinstance(price_usd_cents, int)
-                else "n/a"
-            )
-            refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
             label = shorten(
                 f"{email} | {subscription['status']} | {subscription['subscription_id']}",
-                75,
-            )
-            description = shorten(
-                f"{price_text} | {refund_text}",
                 75,
             )
             options.append(
                 {
                     "text": {"type": "plain_text", "text": label},
                     "value": subscription["subscription_id"],
-                    "description": {"type": "plain_text", "text": description},
                 }
             )
 
@@ -505,24 +555,12 @@ def handle_search_submission(ack, body, client, logger):
 
     try:
         validate_api_key(api_key)
-        filtered = search_subscriptions_by_customer_email(
+        filtered = load_subscription_summaries(
             api_key,
             search_text,
             status_filter,
-            REQUIRED_EMAIL_TEXT,
-            MAX_RESULTS + 1,
+            logger,
         )
-        if not filtered:
-            logger.info(
-                "Fast customer-email search returned no matches; falling back to full subscription scan."
-            )
-            subscriptions = get_all_subscriptions(api_key)
-            filtered = filter_subscriptions(
-                subscriptions,
-                search_text,
-                status_filter,
-                REQUIRED_EMAIL_TEXT,
-            )
 
         if not filtered:
             client.views_update(
@@ -583,9 +621,10 @@ def handle_search_submission(ack, body, client, logger):
 
 
 @app.view(RESULTS_MODAL_CALLBACK)
-def handle_results_submission(ack, body):
+def handle_results_submission(ack, body, client, logger):
     session_id = body["view"]["private_metadata"]
     user_id = body["user"]["id"]
+    confirm_external_id = f"stripe-confirm-{session_id}"
     session = get_session(session_id, user_id)
 
     if not session:
@@ -600,50 +639,74 @@ def handle_results_submission(ack, body):
         .get("selected_options", [])
     )
     if selected_all:
-        ack(
-            response_action="update",
-            view=build_confirmation_modal(
-                session_id,
-                session["subscriptions"],
-                external_id=f"stripe-confirm-{session_id}",
-            ),
-        )
-        return
+        selected = session["subscriptions"]
+    else:
+        selected_ids = []
+        state_values = body["view"]["state"]["values"]
+        for block_id, actions in state_values.items():
+            if not block_id.startswith(SUBSCRIPTION_GROUP_PREFIX):
+                continue
+            selected_options = actions[SUBSCRIPTION_GROUP_ACTION_ID].get(
+                "selected_options",
+                [],
+            )
+            selected_ids.extend(option["value"] for option in selected_options)
 
-    selected_ids = []
-    state_values = body["view"]["state"]["values"]
-    for block_id, actions in state_values.items():
-        if not block_id.startswith(SUBSCRIPTION_GROUP_PREFIX):
-            continue
-        selected_options = actions[SUBSCRIPTION_GROUP_ACTION_ID].get(
-            "selected_options",
-            [],
-        )
-        selected_ids.extend(option["value"] for option in selected_options)
+        selected = []
+        for subscription in session["subscriptions"]:
+            if subscription["subscription_id"] in selected_ids:
+                selected.append(subscription)
 
-    selected = []
-    for subscription in session["subscriptions"]:
-        if subscription["subscription_id"] in selected_ids:
-            selected.append(subscription)
-
-    if not selected or len(selected) != len(selected_ids):
-        ack(
-            response_action="update",
-            view=build_error_modal(
-                "One or more selected subscriptions are no longer available. Run the command again."
-            ),
-        )
-        delete_session(session_id)
-        return
+        if not selected or len(selected) != len(selected_ids):
+            ack(
+                response_action="update",
+                view=build_error_modal(
+                    "One or more selected subscriptions are no longer available. Run the command again."
+                ),
+            )
+            delete_session(session_id)
+            return
 
     ack(
         response_action="update",
-        view=build_confirmation_modal(
-            session_id,
-            selected,
-            external_id=f"stripe-confirm-{session_id}",
+        view=build_loading_modal(
+            "Confirm Cancel",
+            f"Loading invoice and refund details for {len(selected)} selected subscription(s).",
+            external_id=confirm_external_id,
         ),
     )
+
+    try:
+        detailed_subscriptions = load_detailed_subscriptions(
+            session["api_key"],
+            selected,
+        )
+        client.views_update(
+            external_id=confirm_external_id,
+            view=build_confirmation_modal(
+                session_id,
+                detailed_subscriptions,
+                external_id=confirm_external_id,
+            ),
+        )
+    except stripe.error.StripeError as error:
+        message = getattr(error, "user_message", None) or str(error)
+        client.views_update(
+            external_id=confirm_external_id,
+            view=build_error_modal(
+                f"Unable to load the selected subscriptions: {message}",
+                external_id=confirm_external_id,
+            ),
+        )
+    except Exception as error:
+        logger.exception("Unhandled confirmation preparation error")
+        client.views_update(
+            external_id=confirm_external_id,
+            view=build_error_modal(
+                f"Unexpected error: {error}",
+                external_id=confirm_external_id,
+            ),
+        )
 
 
 @app.view(CONFIRM_MODAL_CALLBACK)
