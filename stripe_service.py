@@ -5,6 +5,7 @@ import stripe
 
 PAGE_SIZE = 100
 OVER_FIVE_USD_CENTS = 500
+REQUIRED_EMAIL_TEXT = "openloophealth"
 
 
 def validate_api_key(api_key):
@@ -42,6 +43,140 @@ def get_all_subscriptions(api_key):
     return all_subscriptions
 
 
+def build_customer_email_search_query(search_text="", required_text=REQUIRED_EMAIL_TEXT):
+    terms = []
+    for raw_term in (required_text, search_text):
+        term = (raw_term or "").strip()
+        if not term:
+            continue
+        escaped = term.replace("\\", "\\\\").replace('"', '\\"')
+        terms.append(f'email:"{escaped}"')
+
+    return " AND ".join(terms)
+
+
+def search_customers_by_email(api_key, search_text="", required_text=REQUIRED_EMAIL_TEXT):
+    query = build_customer_email_search_query(search_text, required_text)
+    if not query:
+        return []
+
+    customers = []
+    page = None
+
+    while True:
+        params = {
+            "query": query,
+            "limit": PAGE_SIZE,
+            "api_key": api_key,
+        }
+        if page:
+            params["page"] = page
+
+        response = stripe.Customer.search(**params)
+        customers.extend(response.data)
+
+        page = getattr(response, "next_page", None)
+        if not page:
+            break
+
+    return customers
+
+
+def get_subscriptions_for_customer(
+    api_key,
+    customer_id,
+    status_filter="all",
+    max_results=None,
+):
+    subscriptions = []
+    starting_after = None
+
+    while True:
+        params = {
+            "customer": customer_id,
+            "limit": PAGE_SIZE,
+            "expand": [
+                "data.customer",
+                "data.items.data.price",
+                "data.latest_invoice.charge",
+                "data.latest_invoice.payment_intent",
+            ],
+            "status": status_filter or "all",
+            "api_key": api_key,
+        }
+
+        if starting_after:
+            params["starting_after"] = starting_after
+
+        response = stripe.Subscription.list(**params)
+        subscriptions.extend(response.data)
+
+        if max_results is not None and len(subscriptions) >= max_results:
+            return subscriptions[:max_results]
+
+        if not response.has_more:
+            break
+
+        starting_after = response.data[-1].id
+
+    return subscriptions
+
+
+def search_subscriptions_by_customer_email(
+    api_key,
+    search_text="",
+    status_filter="all",
+    required_email_text=REQUIRED_EMAIL_TEXT,
+    max_results=None,
+):
+    query = build_customer_email_search_query(search_text, required_email_text)
+    if not query:
+        return []
+
+    subscriptions = []
+    seen_subscription_ids = set()
+    customer_page = None
+
+    while True:
+        customer_search_params = {
+            "query": query,
+            "limit": PAGE_SIZE,
+            "api_key": api_key,
+        }
+        if customer_page:
+            customer_search_params["page"] = customer_page
+
+        customer_response = stripe.Customer.search(**customer_search_params)
+
+        for customer in customer_response.data:
+            customer_id = getattr(customer, "id", None)
+            if not customer_id:
+                continue
+
+            remaining_capacity = max_results - len(subscriptions) if max_results is not None else None
+            customer_subscriptions = get_subscriptions_for_customer(
+                api_key,
+                customer_id,
+                status_filter=status_filter,
+                max_results=remaining_capacity,
+            )
+
+            for subscription in customer_subscriptions:
+                if subscription.id in seen_subscription_ids:
+                    continue
+                seen_subscription_ids.add(subscription.id)
+                subscriptions.append(subscription)
+
+                if max_results is not None and len(subscriptions) >= max_results:
+                    return subscriptions
+
+        customer_page = getattr(customer_response, "next_page", None)
+        if not customer_page:
+            break
+
+    return subscriptions
+
+
 def get_customer_email(subscription):
     customer = getattr(subscription, "customer", None)
     return getattr(customer, "email", None) if customer else None
@@ -60,14 +195,25 @@ def serialize_subscription(subscription):
     }
 
 
-def filter_subscriptions_by_email(subscriptions, search_text):
+def filter_subscriptions_by_email(
+    subscriptions,
+    search_text,
+    required_text=REQUIRED_EMAIL_TEXT,
+):
     search_text = search_text.lower().strip()
+    required_text = (required_text or "").lower().strip()
     if not search_text:
-        return subscriptions
+        return [
+            subscription
+            for subscription in subscriptions
+            if required_text in (get_customer_email(subscription) or "").lower()
+        ] if required_text else subscriptions
 
     filtered = []
     for subscription in subscriptions:
         email = (get_customer_email(subscription) or "").lower()
+        if required_text and required_text not in email:
+            continue
         if search_text in email:
             filtered.append(subscription)
     return filtered
@@ -96,8 +242,13 @@ def filter_subscriptions(
     subscriptions,
     search_text="",
     status_filter="all",
+    required_email_text=REQUIRED_EMAIL_TEXT,
 ):
-    filtered = filter_subscriptions_by_email(subscriptions, search_text)
+    filtered = filter_subscriptions_by_email(
+        subscriptions,
+        search_text,
+        required_text=required_email_text,
+    )
 
     if status_filter and status_filter != "all":
         filtered = [
