@@ -10,10 +10,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from stripe_service import (
     cancel_subscription,
-    filter_subscriptions,
     get_latest_invoice_final_usd_cents,
-    get_all_subscriptions,
     is_refund_eligible,
+    search_subscriptions_by_customer_email,
     validate_api_key,
 )
 
@@ -124,6 +123,12 @@ def shorten(text, limit):
     return text[: limit - 3] + "..."
 
 
+def add_external_id(view, external_id=None):
+    if external_id:
+        view["external_id"] = external_id
+    return view
+
+
 def build_search_modal(default_search_text=""):
     status_options = []
     for value, label in STATUS_OPTIONS:
@@ -205,8 +210,8 @@ def build_search_modal(default_search_text=""):
     }
 
 
-def build_loading_modal(title, message):
-    return {
+def build_loading_modal(title, message, external_id=None):
+    return add_external_id({
         "type": "modal",
         "callback_id": "stripe_loading_modal",
         "title": {"type": "plain_text", "text": title},
@@ -217,11 +222,11 @@ def build_loading_modal(title, message):
                 "text": {"type": "mrkdwn", "text": message},
             }
         ],
-    }
+    }, external_id)
 
 
-def build_error_modal(message):
-    return {
+def build_error_modal(message, external_id=None):
+    return add_external_id({
         "type": "modal",
         "callback_id": "stripe_error_modal",
         "title": {"type": "plain_text", "text": "Stripe Error"},
@@ -232,7 +237,7 @@ def build_error_modal(message):
                 "text": {"type": "mrkdwn", "text": message},
             }
         ],
-    }
+    }, external_id)
 
 
 def build_results_modal(
@@ -240,6 +245,7 @@ def build_results_modal(
     search_text,
     status_filter,
     subscriptions,
+    external_id=None,
 ):
     option_list = []
     for subscription in subscriptions:
@@ -257,7 +263,7 @@ def build_results_modal(
 
     filter_text = search_text or "(no filter)"
     status_text = status_filter or "all"
-    return {
+    return add_external_id({
         "type": "modal",
         "callback_id": RESULTS_MODAL_CALLBACK,
         "private_metadata": session_id,
@@ -313,10 +319,10 @@ def build_results_modal(
                 },
             },
         ],
-    }
+    }, external_id)
 
 
-def build_confirmation_modal(session_id, subscriptions):
+def build_confirmation_modal(session_id, subscriptions, external_id=None):
     lines = []
     for subscription in subscriptions[:10]:
         price_usd_cents = subscription.get("price_usd_cents")
@@ -334,7 +340,7 @@ def build_confirmation_modal(session_id, subscriptions):
         lines.append(f"...and {len(subscriptions) - 10} more")
 
     selected_ids = [subscription["subscription_id"] for subscription in subscriptions]
-    return {
+    return add_external_id({
         "type": "modal",
         "callback_id": CONFIRM_MODAL_CALLBACK,
         "private_metadata": json.dumps(
@@ -360,17 +366,14 @@ def build_confirmation_modal(session_id, subscriptions):
                 },
             },
         ],
-    }
+    }, external_id)
 
 
 def get_default_search_text(client, user_id, fallback_username, logger):
     try:
         user = client.users_info(user=user_id)["user"]
     except Exception as error:
-        logger.warning(
-            "Unable to load Slack user info for search prefill, using Slack username: %s",
-            error,
-        )
+        logger.info("Using Slack username for search prefill: %s", error)
         return (fallback_username or "").strip()
 
     email = (
@@ -384,7 +387,7 @@ def get_default_search_text(client, user_id, fallback_username, logger):
     return email.split("@", 1)[0]
 
 
-def build_status_modal(results):
+def build_status_modal(results, external_id=None):
     if not isinstance(results, list):
         results = [results]
 
@@ -413,7 +416,7 @@ def build_status_modal(results):
     if len(results) > 10:
         summary_lines.append(f"...and {len(results) - 10} more")
 
-    return {
+    return add_external_id({
         "type": "modal",
         "callback_id": "stripe_status_modal",
         "title": {"type": "plain_text", "text": "Stripe Result"},
@@ -431,11 +434,11 @@ def build_status_modal(results):
                 },
             },
         ],
-    }
+    }, external_id)
 
 
-def build_too_many_results_modal(count):
-    return {
+def build_too_many_results_modal(count, external_id=None):
+    return add_external_id({
         "type": "modal",
         "callback_id": "stripe_too_many_results_modal",
         "title": {"type": "plain_text", "text": "Too Many Matches"},
@@ -453,7 +456,7 @@ def build_too_many_results_modal(count):
                 },
             }
         ],
-    }
+    }, external_id)
 
 
 @app.command("/stripe-subscriptions")
@@ -482,40 +485,45 @@ def handle_search_submission(ack, body, client, logger):
         .get("selected_option", {})
         .get("value", "all")
     )
-    view_id = body["view"]["id"]
     user_id = body["user"]["id"]
+    loading_external_id = f"stripe-search-{uuid.uuid4().hex}"
 
     ack(
         response_action="update",
         view=build_loading_modal(
             "Stripe Search",
             "Searching subscriptions in Stripe. This can take a few seconds.",
+            external_id=loading_external_id,
         ),
     )
 
     try:
         validate_api_key(api_key)
-        subscriptions = get_all_subscriptions(api_key)
-        filtered = filter_subscriptions(
-            subscriptions,
+        filtered = search_subscriptions_by_customer_email(
+            api_key,
             search_text,
             status_filter,
             REQUIRED_EMAIL_TEXT,
+            MAX_RESULTS + 1,
         )
 
         if not filtered:
             client.views_update(
-                view_id=view_id,
+                external_id=loading_external_id,
                 view=build_error_modal(
-                    "No subscriptions matched that search. Run the command again."
+                    "No subscriptions matched that search. Run the command again.",
+                    external_id=loading_external_id,
                 ),
             )
             return
 
         if len(filtered) > MAX_RESULTS:
             client.views_update(
-                view_id=view_id,
-                view=build_too_many_results_modal(len(filtered)),
+                external_id=loading_external_id,
+                view=build_too_many_results_modal(
+                    len(filtered),
+                    external_id=loading_external_id,
+                ),
             )
             return
 
@@ -528,25 +536,32 @@ def handle_search_submission(ack, body, client, logger):
         )
         session = get_session(session_id, user_id)
         client.views_update(
-            view_id=view_id,
+            external_id=loading_external_id,
             view=build_results_modal(
                 session_id,
                 search_text,
                 session["status_filter"],
                 session["subscriptions"],
+                external_id=loading_external_id,
             ),
         )
     except stripe.error.StripeError as error:
         message = getattr(error, "user_message", None) or str(error)
         client.views_update(
-            view_id=view_id,
-            view=build_error_modal(f"Stripe rejected the request: {message}"),
+            external_id=loading_external_id,
+            view=build_error_modal(
+                f"Stripe rejected the request: {message}",
+                external_id=loading_external_id,
+            ),
         )
     except Exception as error:
         logger.exception("Unhandled Stripe search error")
         client.views_update(
-            view_id=view_id,
-            view=build_error_modal(f"Unexpected error: {error}"),
+            external_id=loading_external_id,
+            view=build_error_modal(
+                f"Unexpected error: {error}",
+                external_id=loading_external_id,
+            ),
         )
 
 
@@ -573,6 +588,7 @@ def handle_results_submission(ack, body):
             view=build_confirmation_modal(
                 session_id,
                 session["subscriptions"],
+                external_id=f"stripe-confirm-{session_id}",
             ),
         )
         return
@@ -603,6 +619,7 @@ def handle_results_submission(ack, body):
         view=build_confirmation_modal(
             session_id,
             selected,
+            external_id=f"stripe-confirm-{session_id}",
         ),
     )
 
@@ -613,7 +630,7 @@ def handle_confirmation_submission(ack, body, client, logger):
     session_id = metadata["session_id"]
     subscription_ids = metadata["subscription_ids"]
     user_id = body["user"]["id"]
-    view_id = body["view"]["id"]
+    view_external_id = body["view"].get("external_id") or f"stripe-confirm-{session_id}"
     session = get_session(session_id, user_id)
 
     if not session:
@@ -628,6 +645,7 @@ def handle_confirmation_submission(ack, body, client, logger):
         view=build_loading_modal(
             "Cancelling",
             f"Cancelling {len(subscription_ids)} subscription(s) and verifying the Stripe response.",
+            external_id=view_external_id,
         ),
     )
 
@@ -650,13 +668,19 @@ def handle_confirmation_submission(ack, body, client, logger):
                     }
                 )
         delete_session(session_id)
-        client.views_update(view_id=view_id, view=build_status_modal(results))
+        client.views_update(
+            external_id=view_external_id,
+            view=build_status_modal(results, external_id=view_external_id),
+        )
     except Exception as error:
         logger.exception("Unhandled Stripe cancellation error")
         delete_session(session_id)
         client.views_update(
-            view_id=view_id,
-            view=build_error_modal(f"Unexpected error: {error}"),
+            external_id=view_external_id,
+            view=build_error_modal(
+                f"Unexpected error: {error}",
+                external_id=view_external_id,
+            ),
         )
 
 
