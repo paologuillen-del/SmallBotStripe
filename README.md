@@ -45,8 +45,8 @@ Create a Slack app and configure:
 Recommended bot scopes:
 
 - `commands`
-- `users:read`
-- `users:read.email`
+
+No `users:*` OAuth scopes are required.
 
 ## Slack Flow
 
