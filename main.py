@@ -11,7 +11,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from stripe_service import (
     cancel_subscription,
     filter_subscriptions,
+    get_latest_invoice_final_usd_cents,
     get_all_subscriptions,
+    is_refund_eligible,
     validate_api_key,
 )
 
@@ -31,10 +33,6 @@ STATUS_OPTIONS = [
     ("paused", "Paused"),
     ("incomplete", "Incomplete"),
     ("incomplete_expired", "Incomplete expired"),
-]
-PRICE_OPTIONS = [
-    ("any", "Any price"),
-    ("over_5_usd", "Over $5 USD (auto-refund on cancel)"),
 ]
 
 SESSIONS = {}
@@ -65,8 +63,6 @@ def store_session(
     api_key,
     search_text,
     status_filter,
-    price_filter,
-    refund_on_cancel,
     subscriptions,
 ):
     cleanup_expired_sessions()
@@ -79,8 +75,6 @@ def store_session(
             "api_key": api_key,
             "search_text": search_text,
             "status_filter": status_filter,
-            "price_filter": price_filter,
-            "refund_on_cancel": refund_on_cancel,
             "subscriptions": summaries,
             "updated_at": time.time(),
         }
@@ -110,25 +104,6 @@ def delete_session(session_id):
 def serialize_for_slack(subscription):
     customer = getattr(subscription, "customer", None)
     email = getattr(customer, "email", None) if customer else None
-    items = getattr(getattr(subscription, "items", None), "data", None) or []
-    price_usd_cents = 0
-    refund_eligible = True if items else False
-
-    for item in items:
-        price = getattr(item, "price", None)
-        currency = getattr(price, "currency", None) if price else None
-        unit_amount = getattr(price, "unit_amount", None) if price else None
-        quantity = getattr(item, "quantity", None) or 1
-
-        if currency != "usd" or unit_amount is None:
-            refund_eligible = False
-            price_usd_cents = None
-            break
-
-        price_usd_cents += unit_amount * quantity
-
-    if price_usd_cents is not None:
-        refund_eligible = refund_eligible and price_usd_cents > 500
 
     return {
         "subscription_id": subscription.id,
@@ -136,8 +111,8 @@ def serialize_for_slack(subscription):
         "customer_id": getattr(customer, "id", None),
         "email": email or "(no email)",
         "current_period_end": getattr(subscription, "current_period_end", None),
-        "price_usd_cents": price_usd_cents,
-        "refund_eligible": refund_eligible,
+        "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
+        "refund_eligible": is_refund_eligible(subscription),
     }
 
 
@@ -147,19 +122,10 @@ def shorten(text, limit):
     return text[: limit - 3] + "..."
 
 
-def build_search_modal():
+def build_search_modal(default_search_text=""):
     status_options = []
     for value, label in STATUS_OPTIONS:
         status_options.append(
-            {
-                "text": {"type": "plain_text", "text": label},
-                "value": value,
-            }
-        )
-
-    price_options = []
-    for value, label in PRICE_OPTIONS:
-        price_options.append(
             {
                 "text": {"type": "plain_text", "text": label},
                 "value": value,
@@ -205,6 +171,7 @@ def build_search_modal():
                 "element": {
                     "type": "plain_text_input",
                     "action_id": "search_text_input",
+                    "initial_value": default_search_text,
                     "placeholder": {
                         "type": "plain_text",
                         "text": "openloophealth",
@@ -228,25 +195,6 @@ def build_search_modal():
                         "value": "all",
                     },
                     "options": status_options,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "price_block",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Price filter"},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "price_select",
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "Choose a price filter",
-                    },
-                    "initial_option": {
-                        "text": {"type": "plain_text", "text": "Any price"},
-                        "value": "any",
-                    },
-                    "options": price_options,
                 },
             },
         ],
@@ -287,8 +235,6 @@ def build_results_modal(
     session_id,
     search_text,
     status_filter,
-    price_filter,
-    refund_on_cancel,
     subscriptions,
 ):
     option_list = []
@@ -307,7 +253,6 @@ def build_results_modal(
 
     filter_text = search_text or "(no filter)"
     status_text = status_filter or "all"
-    price_text = price_filter or "any"
     return {
         "type": "modal",
         "callback_id": RESULTS_MODAL_CALLBACK,
@@ -325,8 +270,7 @@ def build_results_modal(
                         f"*Matches:* {len(subscriptions)}\n"
                         f"*Email filter:* `{filter_text}`\n"
                         f"*Status filter:* `{status_text}`\n"
-                        f"*Price filter:* `{price_text}`\n"
-                        f"*Auto-refund on cancel:* `{refund_on_cancel}`"
+                        "*Auto-refund on cancel:* `latest invoice total > $5 USD`"
                     ),
                 },
             },
@@ -348,7 +292,7 @@ def build_results_modal(
     }
 
 
-def build_confirmation_modal(session_id, subscriptions, refund_on_cancel):
+def build_confirmation_modal(session_id, subscriptions):
     lines = []
     for subscription in subscriptions[:10]:
         price_usd_cents = subscription.get("price_usd_cents")
@@ -357,7 +301,7 @@ def build_confirmation_modal(session_id, subscriptions, refund_on_cancel):
             if isinstance(price_usd_cents, int)
             else "n/a"
         )
-        refund_text = "refund" if refund_on_cancel and subscription.get("refund_eligible") else "no refund"
+        refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
         lines.append(
             f"`{subscription['subscription_id']}` | {subscription['status']} | {price_text} | {refund_text} | {subscription['email']}"
         )
@@ -373,7 +317,6 @@ def build_confirmation_modal(session_id, subscriptions, refund_on_cancel):
             {
                 "session_id": session_id,
                 "subscription_ids": selected_ids,
-                "refund_on_cancel": refund_on_cancel,
             }
         ),
         "notify_on_close": True,
@@ -387,13 +330,31 @@ def build_confirmation_modal(session_id, subscriptions, refund_on_cancel):
                     "type": "mrkdwn",
                     "text": (
                         f"*You are about to cancel {len(subscriptions)} subscription(s):*\n"
-                        f"*Automatic refund mode:* `{refund_on_cancel}`\n"
+                        "*Automatic refund mode:* `latest invoice total > $5 USD`\n"
                         + "\n".join(lines)
                     ),
                 },
             },
         ],
     }
+
+
+def get_default_search_text(client, user_id, logger):
+    try:
+        user = client.users_info(user=user_id)["user"]
+    except Exception as error:
+        logger.warning("Unable to load Slack user info for search prefill: %s", error)
+        return ""
+
+    email = (
+        user.get("profile", {}).get("email")
+        if isinstance(user, dict)
+        else getattr(getattr(user, "profile", None), "email", None)
+    )
+    if not email or "@" not in email:
+        return ""
+
+    return email.split("@", 1)[0]
 
 
 def build_status_modal(results):
@@ -469,9 +430,13 @@ def build_too_many_results_modal(count):
 
 
 @app.command("/stripe-subscriptions")
-def open_stripe_modal(ack, body, client):
+def open_stripe_modal(ack, body, client, logger):
     ack()
-    client.views_open(trigger_id=body["trigger_id"], view=build_search_modal())
+    default_search_text = get_default_search_text(client, body["user_id"], logger)
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view=build_search_modal(default_search_text),
+    )
 
 
 @app.view(SEARCH_MODAL_CALLBACK)
@@ -485,12 +450,6 @@ def handle_search_submission(ack, body, client, logger):
         .get("selected_option", {})
         .get("value", "all")
     )
-    price_filter = (
-        values["price_block"]["price_select"]
-        .get("selected_option", {})
-        .get("value", "any")
-    )
-    refund_on_cancel = price_filter == "over_5_usd"
     view_id = body["view"]["id"]
     user_id = body["user"]["id"]
 
@@ -509,7 +468,6 @@ def handle_search_submission(ack, body, client, logger):
             subscriptions,
             search_text,
             status_filter,
-            price_filter,
         )
 
         if not filtered:
@@ -533,8 +491,6 @@ def handle_search_submission(ack, body, client, logger):
             api_key,
             search_text,
             status_filter,
-            price_filter,
-            refund_on_cancel,
             filtered,
         )
         session = get_session(session_id, user_id)
@@ -544,8 +500,6 @@ def handle_search_submission(ack, body, client, logger):
                 session_id,
                 search_text,
                 session["status_filter"],
-                session["price_filter"],
-                session["refund_on_cancel"],
                 session["subscriptions"],
             ),
         )
@@ -602,7 +556,6 @@ def handle_results_submission(ack, body):
         view=build_confirmation_modal(
             session_id,
             selected,
-            session["refund_on_cancel"],
         ),
     )
 
@@ -612,7 +565,6 @@ def handle_confirmation_submission(ack, body, client, logger):
     metadata = json.loads(body["view"]["private_metadata"])
     session_id = metadata["session_id"]
     subscription_ids = metadata["subscription_ids"]
-    refund_on_cancel = metadata.get("refund_on_cancel", False)
     user_id = body["user"]["id"]
     view_id = body["view"]["id"]
     session = get_session(session_id, user_id)
@@ -640,7 +592,6 @@ def handle_confirmation_submission(ack, body, client, logger):
                     cancel_subscription(
                         session["api_key"],
                         subscription_id,
-                        refund_on_cancel=refund_on_cancel,
                     )
                 )
             except stripe.error.StripeError as error:

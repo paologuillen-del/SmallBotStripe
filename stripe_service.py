@@ -21,6 +21,7 @@ def get_all_subscriptions(api_key):
             "expand": [
                 "data.customer",
                 "data.items.data.price",
+                "data.latest_invoice.charge",
                 "data.latest_invoice.payment_intent",
             ],
             "status": "all",
@@ -54,7 +55,7 @@ def serialize_subscription(subscription):
         "customer_id": getattr(customer, "id", None),
         "email": get_customer_email(subscription) or "(no email)",
         "current_period_end": getattr(subscription, "current_period_end", None),
-        "price_usd_cents": get_subscription_price_usd_cents(subscription),
+        "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
         "refund_eligible": is_refund_eligible(subscription),
     }
 
@@ -72,51 +73,29 @@ def filter_subscriptions_by_email(subscriptions, search_text):
     return filtered
 
 
-def get_subscription_price_usd_cents(subscription):
-    items = getattr(getattr(subscription, "items", None), "data", None) or []
-    total_cents = 0
+def get_latest_invoice_final_usd_cents(subscription):
+    latest_invoice = getattr(subscription, "latest_invoice", None)
+    if not latest_invoice or isinstance(latest_invoice, str):
+        return None
 
-    for item in items:
-        price = getattr(item, "price", None)
-        if not price:
-            return None
+    currency = getattr(latest_invoice, "currency", None)
+    total = getattr(latest_invoice, "total", None)
 
-        currency = getattr(price, "currency", None)
-        unit_amount = getattr(price, "unit_amount", None)
-        quantity = getattr(item, "quantity", None) or 1
+    if currency != "usd" or total is None:
+        return None
 
-        if currency != "usd" or unit_amount is None:
-            return None
-
-        total_cents += unit_amount * quantity
-
-    return total_cents
+    return total
 
 
 def is_refund_eligible(subscription):
-    price_usd_cents = get_subscription_price_usd_cents(subscription)
+    price_usd_cents = get_latest_invoice_final_usd_cents(subscription)
     return price_usd_cents is not None and price_usd_cents > OVER_FIVE_USD_CENTS
-
-
-def filter_subscriptions_by_price(subscriptions, price_filter="any"):
-    if not price_filter or price_filter == "any":
-        return subscriptions
-
-    if price_filter == "over_5_usd":
-        return [
-            subscription
-            for subscription in subscriptions
-            if is_refund_eligible(subscription)
-        ]
-
-    return subscriptions
 
 
 def filter_subscriptions(
     subscriptions,
     search_text="",
     status_filter="all",
-    price_filter="any",
 ):
     filtered = filter_subscriptions_by_email(subscriptions, search_text)
 
@@ -127,7 +106,7 @@ def filter_subscriptions(
             if getattr(subscription, "status", None) == status_filter
         ]
 
-    return filter_subscriptions_by_price(filtered, price_filter)
+    return filtered
 
 
 def print_subscription_summary(subscriptions):
@@ -152,11 +131,16 @@ def print_subscription_list(subscriptions):
         )
 
 
-def cancel_subscription(api_key, subscription_id, refund_on_cancel=False):
+def cancel_subscription(api_key, subscription_id):
     subscription = stripe.Subscription.retrieve(
         subscription_id,
         api_key=api_key,
-        expand=["customer", "items.data.price", "latest_invoice.payment_intent"],
+        expand=[
+            "customer",
+            "items.data.price",
+            "latest_invoice.charge",
+            "latest_invoice.payment_intent",
+        ],
     )
     response = stripe.Subscription.delete(subscription_id, api_key=api_key)
     verified = stripe.Subscription.retrieve(
@@ -170,22 +154,31 @@ def cancel_subscription(api_key, subscription_id, refund_on_cancel=False):
         "refunded": False,
         "reason": None,
         "refund_id": None,
-        "price_usd_cents": get_subscription_price_usd_cents(subscription),
+        "price_usd_cents": get_latest_invoice_final_usd_cents(subscription),
     }
 
-    if refund_on_cancel and refund_details["eligible"]:
+    if refund_details["eligible"]:
         refund_details["attempted"] = True
         latest_invoice = getattr(subscription, "latest_invoice", None)
-        payment_intent = getattr(latest_invoice, "payment_intent", None) if latest_invoice else None
+        payment_intent = (
+            getattr(latest_invoice, "payment_intent", None) if latest_invoice else None
+        )
         payment_intent_id = getattr(payment_intent, "id", payment_intent)
+        charge = getattr(latest_invoice, "charge", None) if latest_invoice else None
+        charge_id = getattr(charge, "id", charge)
 
-        if payment_intent_id:
+        if payment_intent_id or charge_id:
             try:
-                refund = stripe.Refund.create(
-                    api_key=api_key,
-                    payment_intent=payment_intent_id,
-                    reason="requested_by_customer",
-                )
+                refund_params = {
+                    "api_key": api_key,
+                    "reason": "requested_by_customer",
+                }
+                if payment_intent_id:
+                    refund_params["payment_intent"] = payment_intent_id
+                else:
+                    refund_params["charge"] = charge_id
+
+                refund = stripe.Refund.create(**refund_params)
                 refund_details["refunded"] = True
                 refund_details["refund_id"] = refund.id
             except stripe.error.StripeError as error:
@@ -194,7 +187,7 @@ def cancel_subscription(api_key, subscription_id, refund_on_cancel=False):
                 )
         else:
             refund_details["reason"] = (
-                "No latest invoice payment intent available for refund."
+                "No latest invoice payment record available for refund."
             )
 
     response_details = {

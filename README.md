@@ -3,7 +3,7 @@
 This project now includes:
 
 - `script.py`: terminal workflow
-- `slack_app.py`: Slack app workflow using a modal and Socket Mode
+- `main.py`: Slack app workflow using a modal and Socket Mode
 - `stripe_service.py`: shared Stripe operations
 
 ## Install
@@ -30,7 +30,7 @@ Set these environment variables:
 Then run:
 
 ```bash
-python3 slack_app.py
+python3 main.py
 ```
 
 ## Slack App Setup
@@ -45,18 +45,21 @@ Create a Slack app and configure:
 Recommended bot scopes:
 
 - `commands`
+- `users:read`
+- `users:read.email`
 
 ## Slack Flow
 
 1. Run `/stripe-subscriptions`.
 2. Paste the Stripe restricted key into the modal.
-3. Enter optional email text to filter subscriptions.
+3. Review or edit the prefilled email text filter.
 4. Pick one matching subscription.
 5. Confirm cancellation.
-6. Review the Stripe result and verification status.
+6. Review the Stripe result, verification status, and any automatic refund result.
 
 ## Security Notes
 
 - The Slack app keeps the pasted Stripe restricted key only in memory for the active workflow session.
 - The app deletes the in-memory session after cancellation or when the modal is closed.
 - Slack modal inputs are not masked like password fields, so use restricted keys only.
+- If the latest subscription invoice total after discounts is more than `$5 USD`, the app also attempts a refund for that latest invoice payment.
