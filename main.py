@@ -323,6 +323,13 @@ def build_results_modal(
 
         for subscription in group_subscriptions:
             email = subscription["email"]
+            price_usd_cents = subscription.get("price_usd_cents")
+            price_text = (
+                f"${price_usd_cents / 100:.2f}"
+                if isinstance(price_usd_cents, int)
+                else "n/a"
+            )
+            refund_text = "refund" if subscription.get("refund_eligible") else "no refund"
             label = shorten(
                 f"{email} | {subscription['status']} | {subscription['subscription_id']}",
                 75,
@@ -331,6 +338,10 @@ def build_results_modal(
                 {
                     "text": {"type": "plain_text", "text": label},
                     "value": subscription["subscription_id"],
+                    "description": {
+                        "type": "plain_text",
+                        "text": shorten(f"{price_text} | {refund_text}", 75),
+                    },
                 }
             )
 
@@ -582,12 +593,13 @@ def handle_search_submission(ack, body, client, logger):
             )
             return
 
+        detailed_filtered = load_detailed_subscriptions(api_key, filtered)
         session_id = store_session(
             user_id,
             api_key,
             search_text,
             status_filter,
-            filtered,
+            detailed_filtered,
         )
         session = get_session(session_id, user_id)
         client.views_update(
@@ -621,10 +633,9 @@ def handle_search_submission(ack, body, client, logger):
 
 
 @app.view(RESULTS_MODAL_CALLBACK)
-def handle_results_submission(ack, body, client, logger):
+def handle_results_submission(ack, body):
     session_id = body["view"]["private_metadata"]
     user_id = body["user"]["id"]
-    confirm_external_id = f"stripe-confirm-{session_id}"
     session = get_session(session_id, user_id)
 
     if not session:
@@ -669,44 +680,12 @@ def handle_results_submission(ack, body, client, logger):
 
     ack(
         response_action="update",
-        view=build_loading_modal(
-            "Confirm Cancel",
-            f"Loading invoice and refund details for {len(selected)} selected subscription(s).",
-            external_id=confirm_external_id,
+        view=build_confirmation_modal(
+            session_id,
+            selected,
+            external_id=f"stripe-confirm-{session_id}",
         ),
     )
-
-    try:
-        detailed_subscriptions = load_detailed_subscriptions(
-            session["api_key"],
-            selected,
-        )
-        client.views_update(
-            external_id=confirm_external_id,
-            view=build_confirmation_modal(
-                session_id,
-                detailed_subscriptions,
-                external_id=confirm_external_id,
-            ),
-        )
-    except stripe.error.StripeError as error:
-        message = getattr(error, "user_message", None) or str(error)
-        client.views_update(
-            external_id=confirm_external_id,
-            view=build_error_modal(
-                f"Unable to load the selected subscriptions: {message}",
-                external_id=confirm_external_id,
-            ),
-        )
-    except Exception as error:
-        logger.exception("Unhandled confirmation preparation error")
-        client.views_update(
-            external_id=confirm_external_id,
-            view=build_error_modal(
-                f"Unexpected error: {error}",
-                external_id=confirm_external_id,
-            ),
-        )
 
 
 @app.view(CONFIRM_MODAL_CALLBACK)
