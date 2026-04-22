@@ -286,6 +286,14 @@ def get_selected_subscriptions(session):
     return load_detailed_subscriptions(session["api_key"], selected_summaries)
 
 
+def is_select_all_selected(state_values):
+    return bool(
+        state_values.get("select_all_block", {})
+        .get(SELECT_ALL_ACTION_ID, {})
+        .get("selected_options", [])
+    )
+
+
 def shorten(text, limit):
     if len(text) <= limit:
         return text
@@ -976,49 +984,102 @@ def handle_results_page_size_change(ack, body, client):
     update_results_page_view(ack, body, client, page_size=page_size)
 
 
-@app.view(RESULTS_MODAL_CALLBACK)
-def handle_results_submission(ack, body):
-    session_id = body["view"]["private_metadata"]
-    user_id = body["user"]["id"]
+def prepare_results_confirmation(
+    client,
+    session_id,
+    user_id,
+    state_values,
+    results_external_id,
+    logger,
+):
     session = get_session(session_id, user_id)
 
     if not session:
-        ack(
-            response_action="update",
-            view=build_error_modal("That session expired. Run the command again."),
+        client.views_update(
+            external_id=results_external_id,
+            view=build_error_modal(
+                "That session expired. Run the command again.",
+                external_id=results_external_id,
+            ),
         )
         return
 
-    selected_all = (
-        body["view"]["state"]["values"]["select_all_block"][SELECT_ALL_ACTION_ID]
-        .get("selected_options", [])
-    )
-    if selected_all:
-        session["select_all_enabled"] = True
-        selected = get_selected_subscriptions(session)
-    else:
-        session["select_all_enabled"] = False
-        sync_selected_ids_from_state(session, body["view"]["state"]["values"])
-        selected = get_selected_subscriptions(session)
+    try:
+        if is_select_all_selected(state_values):
+            session["select_all_enabled"] = True
+            selected = get_selected_subscriptions(session)
+        else:
+            session["select_all_enabled"] = False
+            sync_selected_ids_from_state(session, state_values)
+            selected = get_selected_subscriptions(session)
 
-        if not selected or len(selected) != len(session["selected_subscription_ids"]):
-            ack(
-                response_action="update",
-                view=build_error_modal(
-                    "One or more selected subscriptions are no longer available. Run the command again."
-                ),
-            )
-            delete_session(session_id)
-            return
+            if not selected or len(selected) != len(session["selected_subscription_ids"]):
+                client.views_update(
+                    external_id=results_external_id,
+                    view=build_error_modal(
+                        "One or more selected subscriptions are no longer available. Run the command again.",
+                        external_id=results_external_id,
+                    ),
+                )
+                delete_session(session_id)
+                return
+
+        client.views_update(
+            external_id=results_external_id,
+            view=build_confirmation_modal(
+                session_id,
+                selected,
+                external_id=f"stripe-confirm-{session_id}",
+            ),
+        )
+    except stripe.error.StripeError as error:
+        message = getattr(error, "user_message", None) or str(error)
+        client.views_update(
+            external_id=results_external_id,
+            view=build_error_modal(
+                f"Stripe rejected the request: {message}",
+                external_id=results_external_id,
+            ),
+        )
+    except Exception as error:
+        logger.exception("Unhandled Stripe results submission error")
+        client.views_update(
+            external_id=results_external_id,
+            view=build_error_modal(
+                f"Unexpected error: {error}",
+                external_id=results_external_id,
+            ),
+        )
+
+
+@app.view(RESULTS_MODAL_CALLBACK)
+def handle_results_submission(ack, body, client, logger):
+    session_id = body["view"]["private_metadata"]
+    user_id = body["user"]["id"]
+    results_external_id = body["view"].get("external_id") or f"stripe-results-{session_id}"
+    state_values = body["view"]["state"]["values"]
 
     ack(
         response_action="update",
-        view=build_confirmation_modal(
-            session_id,
-            selected,
-            external_id=f"stripe-confirm-{session_id}",
+        view=build_loading_modal(
+            "Preparing Review",
+            "Loading the selected subscriptions. This can take a few seconds.",
+            external_id=results_external_id,
         ),
     )
+
+    threading.Thread(
+        target=prepare_results_confirmation,
+        kwargs={
+            "client": client,
+            "session_id": session_id,
+            "user_id": user_id,
+            "state_values": state_values,
+            "results_external_id": results_external_id,
+            "logger": logger,
+        },
+        daemon=True,
+    ).start()
 
 
 @app.view(CONFIRM_MODAL_CALLBACK)
